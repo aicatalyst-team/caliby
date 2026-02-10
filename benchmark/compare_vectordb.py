@@ -205,6 +205,126 @@ def load_deep10m_data(data_dir='./deep10M'):
     return base_vectors, query_vectors, groundtruth
 
 
+def download_cohere_dataset(dataset_name, data_dir):
+    """Download Cohere dataset from public sources.
+    
+    Cohere datasets are large Wikipedia embedding datasets. We'll download
+    from HuggingFace or use direct S3 links if available.
+    
+    Args:
+        dataset_name: 'cohere1m' or 'cohere10m'
+        data_dir: Directory to save the dataset
+    """
+    print(f"\nCohere datasets require manual download.")
+    print(f"\nFor {dataset_name}, you have these options:")
+    print()
+    print("Option 1: Use HuggingFace datasets (recommended)")
+    print("  pip install datasets")
+    print("  from datasets import load_dataset")
+    print("  dataset = load_dataset('Cohere/wikipedia-22-12-en-embeddings')")
+    print()
+    print("Option 2: Download pre-processed HDF5 files")
+    print("  1M subset: https://storage.googleapis.com/ann-filtered-benchmark/cohere-1m.hdf5")
+    print("  10M subset: https://storage.googleapis.com/ann-filtered-benchmark/cohere-10m.hdf5")
+    print()
+    print("  Download command:")
+    print(f"  wget https://storage.googleapis.com/ann-filtered-benchmark/{dataset_name}.hdf5 -P {data_dir}")
+    print()
+    
+    # Try alternative download URLs
+    import urllib.request
+    
+    # Try Google Storage bucket (common for ANN benchmarks)
+    urls_to_try = [
+        f"https://storage.googleapis.com/ann-filtered-benchmark/{dataset_name}.hdf5",
+        f"https://ann-benchmarks.com/datasets/{dataset_name}.hdf5",
+        f"http://vectors.erikbern.com/{dataset_name}.hdf5",
+    ]
+    
+    output_file = os.path.join(data_dir, f'{dataset_name}.hdf5')
+    os.makedirs(data_dir, exist_ok=True)
+    
+    for url in urls_to_try:
+        try:
+            print(f"Trying {url}...")
+            
+            def reporthook(count, block_size, total_size):
+                if total_size > 0:
+                    percent = min(int(count * block_size * 100 / total_size), 100)
+                    mb_downloaded = count * block_size / (1024 * 1024)
+                    mb_total = total_size / (1024 * 1024)
+                    if count % 100 == 0:
+                        print(f"\r  Downloaded: {mb_downloaded:.1f}/{mb_total:.1f} MB ({percent}%)", end='', flush=True)
+            
+            urllib.request.urlretrieve(url, output_file, reporthook=reporthook)
+            print(f"\n  ✓ Download complete: {output_file}")
+            return output_file
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            continue
+    
+    # If all downloads failed
+    print(f"\n✗ Automatic download failed for {dataset_name}")
+    print(f"Please download manually and place at: {output_file}")
+    raise FileNotFoundError(f"Could not download {dataset_name} dataset")
+
+
+def load_cohere_data(data_dir, dataset_name='cohere1m'):
+    """Load Cohere dataset from HDF5 file.
+    
+    Cohere datasets from ann-benchmarks contain:
+    - train: Base vectors for indexing
+    - test: Query vectors
+    - neighbors: Ground truth nearest neighbor indices
+    - distances: Ground truth distances
+    
+    Args:
+        data_dir: Directory containing the dataset
+        dataset_name: 'cohere1m' or 'cohere10m'
+    
+    Returns:
+        base_vectors, query_vectors, groundtruth
+    """
+    try:
+        import h5py
+    except ImportError:
+        print("Error: h5py not installed. Install with: pip install h5py")
+        raise
+    
+    hdf5_file = os.path.join(data_dir, f'{dataset_name}.hdf5')
+    
+    # Download if not exists
+    if not os.path.exists(hdf5_file):
+        print(f"Dataset file not found at {hdf5_file}")
+        download_cohere_dataset(dataset_name, data_dir)
+    
+    print(f"\nLoading {dataset_name} dataset from {hdf5_file}...")
+    
+    with h5py.File(hdf5_file, 'r') as f:
+        # Load base vectors (for indexing)
+        base_vectors = f['train'][:].astype(np.float32)
+        
+        # Load query vectors
+        query_vectors = f['test'][:].astype(np.float32)
+        
+        # Load ground truth (nearest neighbor indices)
+        groundtruth = f['neighbors'][:].astype(np.int32)
+        
+        print(f"  Base vectors: {base_vectors.shape}")
+        print(f"  Query vectors: {query_vectors.shape}")
+        print(f"  Ground truth: {groundtruth.shape}")
+        
+        # Print dataset metadata if available
+        if 'distance' in f.attrs:
+            print(f"  Distance metric: {f.attrs['distance']}")
+        if 'dimension' in f.attrs:
+            print(f"  Dimension: {f.attrs['dimension']}")
+    
+    return base_vectors, query_vectors, groundtruth
+
+
 def load_qdrant_filtered_dataset(data_dir, dataset_name):
     """
     Load datasets from qdrant/ann-filtering-benchmark-datasets format.
@@ -2323,8 +2443,8 @@ DEFAULT_DATASETS_DIR = '/home/zxjcarrot/Workspace/datasets'
 def main():
     parser = argparse.ArgumentParser(description='Benchmark Caliby vs ChromaDB vs Qdrant vs Weaviate')
     parser.add_argument('--dataset', type=str, default='sift1m', 
-                        choices=['sift1m', 'deep10m', 'arxiv', 'hnm'],
-                        help='Dataset to use: sift1m (1M 128-dim), deep10m (10M 96-dim), arxiv (2.1M 384-dim), hnm (105K 2048-dim)')
+                        choices=['sift1m', 'deep10m', 'cohere1m', 'cohere10m', 'arxiv', 'hnm'],
+                        help='Dataset to use: sift1m (1M 128-dim), deep10m (10M 96-dim), cohere1m (1M 768-dim), cohere10m (10M 768-dim), arxiv (2.1M 384-dim), hnm (105K 2048-dim)')
     parser.add_argument('--data-dir', type=str, default=None,
                         help=f'Directory containing dataset (default: {DEFAULT_DATASETS_DIR}/<dataset>)')
     parser.add_argument('--num-vectors', type=int, default=None,
@@ -2355,22 +2475,28 @@ def main():
         dataset_dirs = {
             'sift1m': os.path.join(DEFAULT_DATASETS_DIR, 'sift1m'),
             'deep10m': os.path.join(DEFAULT_DATASETS_DIR, 'deep10M'),
+            'cohere1m': os.path.join(DEFAULT_DATASETS_DIR, 'cohere'),
+            'cohere10m': os.path.join(DEFAULT_DATASETS_DIR, 'cohere'),
             'arxiv': os.path.join(DEFAULT_DATASETS_DIR, 'arxiv'),
             'hnm': os.path.join(DEFAULT_DATASETS_DIR, 'hnm'),
         }
         args.data_dir = dataset_dirs.get(args.dataset, os.path.join(DEFAULT_DATASETS_DIR, args.dataset))
     
-    # Check if data exists
+    # Check if data exists (create directory for Cohere datasets if auto-downloading)
     if not os.path.exists(args.data_dir):
-        print(f"Error: Data directory {args.data_dir} not found")
-        dataset_help = {
-            'sift1m': "Please download SIFT1M dataset first",
-            'deep10m': "Please download Deep10M dataset first",
-            'arxiv': "Please download ArXiv dataset from https://storage.googleapis.com/ann-filtered-benchmark/arxiv.tar.gz",
-            'hnm': "Please download H&M dataset from https://storage.googleapis.com/ann-filtered-benchmark/hnm.tgz"
-        }
-        print(dataset_help.get(args.dataset, f"Please download {args.dataset} dataset"))
-        sys.exit(1)
+        if args.dataset in ['cohere1m', 'cohere10m']:
+            print(f"Creating data directory {args.data_dir} for Cohere dataset")
+            os.makedirs(args.data_dir, exist_ok=True)
+        else:
+            print(f"Error: Data directory {args.data_dir} not found")
+            dataset_help = {
+                'sift1m': "Please download SIFT1M dataset first",
+                'deep10m': "Please download Deep10M dataset first",
+                'arxiv': "Please download ArXiv dataset from https://storage.googleapis.com/ann-filtered-benchmark/arxiv.tar.gz",
+                'hnm': "Please download H&M dataset from https://storage.googleapis.com/ann-filtered-benchmark/hnm.tgz"
+            }
+            print(dataset_help.get(args.dataset, f"Please download {args.dataset} dataset"))
+            sys.exit(1)
     
     # Load dataset based on choice
     test_queries = None  # For filtered benchmark datasets
@@ -2382,6 +2508,12 @@ def main():
     elif args.dataset == 'deep10m':
         base_vectors, query_vectors, groundtruth = load_deep10m_data(args.data_dir)
         dataset_name = "Deep10M"
+    elif args.dataset == 'cohere1m':
+        base_vectors, query_vectors, groundtruth = load_cohere_data(args.data_dir, 'cohere1m')
+        dataset_name = "Cohere-1M"
+    elif args.dataset == 'cohere10m':
+        base_vectors, query_vectors, groundtruth = load_cohere_data(args.data_dir, 'cohere10m')
+        dataset_name = "Cohere-10M"
     elif args.dataset == 'arxiv':
         base_vectors, test_queries, payloads = load_qdrant_filtered_dataset(args.data_dir, 'arxiv')
         # Limit vectors and queries first to speed up ground truth computation
@@ -2419,7 +2551,7 @@ def main():
         print(f"Error: Unknown dataset {args.dataset}")
         sys.exit(1)
     
-    # Limit vectors if requested (for sift1m and deep10m - arxiv/hnm already limited above)
+    # Limit vectors if requested (for sift1m, deep10m, cohere - arxiv/hnm already limited above)
     if args.num_vectors is not None and args.dataset not in ['arxiv', 'hnm']:
         print(f"\nLimiting to {args.num_vectors} vectors for testing")
         base_vectors = base_vectors[:args.num_vectors]
@@ -2427,7 +2559,7 @@ def main():
         # The original ground truth was computed against the full dataset,
         # so most IDs won't exist in our subset, leading to very low recall.
         # Use the correct distance metric for the dataset
-        metric = 'cosine' if args.dataset in ['arxiv', 'hnm'] else 'l2'
+        metric = 'cosine' if args.dataset in ['arxiv', 'hnm', 'cohere1m', 'cohere10m'] else 'l2'
         groundtruth = compute_groundtruth(base_vectors, query_vectors, k=100, metric=metric)
     
     # Benchmark parameters
