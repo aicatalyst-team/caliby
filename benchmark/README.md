@@ -177,3 +177,48 @@ WINNERS:
 - Benchmark includes warm-up phase before measurements
 - All libraries use L2 distance metric
 - Results may vary based on hardware and configuration
+
+## Cohere Datasets
+
+The benchmark now supports Cohere Wikipedia embedding datasets (768-dimensional vectors).
+
+### Available Datasets
+
+- **cohere1m**: 1 million vectors, 768 dimensions, 10K queries
+- **cohere10m**: 10 million vectors, 768 dimensions, 10K queries
+
+### Creating Datasets
+
+Use the provided script to create synthetic Cohere-like datasets:
+
+```bash
+# Create Cohere-1M dataset (~3GB)
+python3 create_cohere_datasets.py --dataset cohere1m
+
+# Create Cohere-10M dataset (~30GB, takes 30-60 minutes)
+python3 create_cohere_datasets.py --dataset cohere10m
+
+# Create both
+python3 create_cohere_datasets.py --dataset both
+```
+
+The datasets will be created at: `~/Workspace/datasets/cohere/`
+
+### Running Benchmarks
+
+```bash
+# Benchmark with Cohere-1M
+python3 compare_vectordb.py --dataset cohere1m --caliby-only
+
+# Benchmark with Cohere-10M (subset)
+python3 compare_vectordb.py --dataset cohere10m --caliby-only --num-vectors 100000
+
+# Full Cohere-10M benchmark
+python3 compare_vectordb.py --dataset cohere10m --caliby-only
+```
+
+### Real Cohere Datasets
+
+For real Cohere Wikipedia embeddings:
+- HuggingFace: https://huggingface.co/datasets/Cohere/wikipedia-22-12-en-embeddings
+- 35M+ Wikipedia articles with 768-dim embeddings from Cohere's embedding model
