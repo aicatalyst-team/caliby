@@ -6,6 +6,7 @@
 #include "collection.hpp"
 #include "btree_index.hpp"
 #include "text_index.hpp"
+#include "array_index.hpp"
 #include "catalog.hpp"
 #include "hnsw.hpp"
 #include "distance.hpp"
@@ -13,8 +14,11 @@
 
 #include <algorithm>
 #include <ctime>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_set>
+#include <absl/container/flat_hash_set.h>
 
 // Type aliases for HNSW indices with different distance metrics
 using HnswL2 = HNSW<hnsw_distance::SIMDAcceleratedL2>;
@@ -52,6 +56,20 @@ public:
     std::vector<std::pair<float, uint32_t>> searchKnn(
         const float* query, size_t k, size_t ef_search = 100) override {
         return hnsw_.searchKnn(query, k, ef_search);
+    }
+
+    std::vector<std::pair<float, uint32_t>> searchKnnFiltered(
+        const float* query, size_t k, size_t ef_search,
+        const std::function<bool(uint32_t)>& filter_fn) override {
+        return hnsw_.searchKnnFiltered(query, k, ef_search, filter_fn);
+    }
+    
+    std::vector<std::pair<float, uint32_t>> searchKnnFilteredACORN(
+        const float* query, size_t k, size_t ef_search,
+        const std::function<bool(uint32_t)>& filter_fn,
+        const std::vector<uint32_t>& matching_ids,
+        float selectivity) override {
+        return hnsw_.searchKnnFilteredACORN(query, k, ef_search, filter_fn, matching_ids, selectivity);
     }
     
     std::vector<std::pair<float, uint32_t>> computeDistances(
@@ -328,6 +346,66 @@ MetadataValue json_to_metadata_value(const nlohmann::json& j) {
 FilterCondition FilterCondition::from_json(const nlohmann::json& j) {
     FilterCondition cond;
     
+    // Handle verbose format: {"field": "name", "op": "eq", "value": ...}
+    if (j.contains("field") && j.contains("op") && j.contains("value")) {
+        cond.field = j["field"].get<std::string>();
+        std::string op_str = j["op"].get<std::string>();
+        
+        if (op_str == "eq" || op_str == "$eq") cond.op = FilterOp::EQ;
+        else if (op_str == "ne" || op_str == "$ne") cond.op = FilterOp::NE;
+        else if (op_str == "gt" || op_str == "$gt") cond.op = FilterOp::GT;
+        else if (op_str == "gte" || op_str == "$gte") cond.op = FilterOp::GTE;
+        else if (op_str == "lt" || op_str == "$lt") cond.op = FilterOp::LT;
+        else if (op_str == "lte" || op_str == "$lte") cond.op = FilterOp::LTE;
+        else if (op_str == "in" || op_str == "$in") cond.op = FilterOp::IN;
+        else if (op_str == "nin" || op_str == "$nin") cond.op = FilterOp::NIN;
+        else if (op_str == "contains" || op_str == "$contains") cond.op = FilterOp::CONTAINS;
+        else throw std::runtime_error("Unknown filter operator: " + op_str);
+        
+        const auto& val = j["value"];
+        if (val.is_string()) {
+            cond.value = val.get<std::string>();
+        } else if (val.is_number_integer()) {
+            cond.value = val.get<int64_t>();
+        } else if (val.is_number_float()) {
+            cond.value = val.get<double>();
+        } else if (val.is_boolean()) {
+            cond.value = val.get<bool>();
+        } else if (val.is_array()) {
+            if (!val.empty() && val[0].is_string()) {
+                cond.value = val.get<std::vector<std::string>>();
+            } else {
+                cond.value = val.get<std::vector<int64_t>>();
+            }
+        }
+        return cond;
+    }
+    
+    // Handle verbose "and"/"or" format (without $)
+    if (j.contains("and")) {
+        cond.op = FilterOp::AND;
+        for (const auto& child : j["and"]) {
+            cond.children.push_back(from_json(child));
+        }
+        return cond;
+    }
+    
+    if (j.contains("or")) {
+        cond.op = FilterOp::OR;
+        for (const auto& child : j["or"]) {
+            cond.children.push_back(from_json(child));
+        }
+        return cond;
+    }
+    
+    if (j.contains("not")) {
+        // Handle NOT as a special case: negate the inner condition
+        // We'll implement NOT as a single-element NOT (AND with negation)
+        cond.op = FilterOp::NOT;
+        cond.children.push_back(from_json(j["not"]));
+        return cond;
+    }
+    
     if (j.contains("$and")) {
         cond.op = FilterOp::AND;
         for (const auto& child : j["$and"]) {
@@ -344,42 +422,63 @@ FilterCondition FilterCondition::from_json(const nlohmann::json& j) {
         return cond;
     }
     
+    if (j.contains("$not")) {
+        cond.op = FilterOp::NOT;
+        cond.children.push_back(from_json(j["$not"]));
+        return cond;
+    }
+    
     // Single field condition
     for (auto& [key, val] : j.items()) {
         cond.field = key;
         
         if (val.is_object()) {
-            // Operator form: {"field": {"$gt": 10}}
+            // Operator form: {"field": {"$gt": 10}} or {"field": {"$gt": 10, "$lt": 100}}
+            // If multiple operators, create AND condition
+            std::vector<FilterCondition> sub_conditions;
+            
             for (auto& [op_str, op_val] : val.items()) {
-                if (op_str == "$eq") cond.op = FilterOp::EQ;
-                else if (op_str == "$ne") cond.op = FilterOp::NE;
-                else if (op_str == "$gt") cond.op = FilterOp::GT;
-                else if (op_str == "$gte") cond.op = FilterOp::GTE;
-                else if (op_str == "$lt") cond.op = FilterOp::LT;
-                else if (op_str == "$lte") cond.op = FilterOp::LTE;
-                else if (op_str == "$in") cond.op = FilterOp::IN;
-                else if (op_str == "$nin") cond.op = FilterOp::NIN;
-                else if (op_str == "$contains") cond.op = FilterOp::CONTAINS;
+                FilterCondition sub_cond;
+                sub_cond.field = key;
+                
+                if (op_str == "$eq") sub_cond.op = FilterOp::EQ;
+                else if (op_str == "$ne") sub_cond.op = FilterOp::NE;
+                else if (op_str == "$gt") sub_cond.op = FilterOp::GT;
+                else if (op_str == "$gte") sub_cond.op = FilterOp::GTE;
+                else if (op_str == "$lt") sub_cond.op = FilterOp::LT;
+                else if (op_str == "$lte") sub_cond.op = FilterOp::LTE;
+                else if (op_str == "$in") sub_cond.op = FilterOp::IN;
+                else if (op_str == "$nin") sub_cond.op = FilterOp::NIN;
+                else if (op_str == "$contains") sub_cond.op = FilterOp::CONTAINS;
                 else throw std::runtime_error("Unknown filter operator: " + op_str);
                 
                 // Convert JSON value to MetadataValue
                 if (op_val.is_string()) {
-                    cond.value = op_val.get<std::string>();
+                    sub_cond.value = op_val.get<std::string>();
                 } else if (op_val.is_number_integer()) {
-                    cond.value = op_val.get<int64_t>();
+                    sub_cond.value = op_val.get<int64_t>();
                 } else if (op_val.is_number_float()) {
-                    cond.value = op_val.get<double>();
+                    sub_cond.value = op_val.get<double>();
                 } else if (op_val.is_boolean()) {
-                    cond.value = op_val.get<bool>();
+                    sub_cond.value = op_val.get<bool>();
                 } else if (op_val.is_array()) {
                     // Check first element type
                     if (!op_val.empty() && op_val[0].is_string()) {
-                        cond.value = op_val.get<std::vector<std::string>>();
+                        sub_cond.value = op_val.get<std::vector<std::string>>();
                     } else {
-                        cond.value = op_val.get<std::vector<int64_t>>();
+                        sub_cond.value = op_val.get<std::vector<int64_t>>();
                     }
                 }
-                break;  // Only one operator per field
+                sub_conditions.push_back(std::move(sub_cond));
+            }
+            
+            // If single operator, use directly; otherwise create AND
+            if (sub_conditions.size() == 1) {
+                cond = std::move(sub_conditions[0]);
+            } else if (sub_conditions.size() > 1) {
+                cond.op = FilterOp::AND;
+                cond.field.clear();  // AND conditions don't have a field
+                cond.children = std::move(sub_conditions);
             }
         } else {
             // Implicit equality: {"field": "value"}
@@ -413,6 +512,10 @@ bool FilterCondition::evaluate(const nlohmann::json& metadata) const {
                 if (child.evaluate(metadata)) return true;
             }
             return false;
+        }
+        case FilterOp::NOT: {
+            if (children.empty()) return true;
+            return !children[0].evaluate(metadata);
         }
         default: break;
     }
@@ -724,7 +827,7 @@ std::unique_ptr<Collection> Collection::open(const std::string& name) {
                     uint64_t current_doc_count = collection->doc_count_.load();
                     for (uint64_t doc_id = 0; doc_id < current_doc_count; ++doc_id) {
                         try {
-                            Document doc = collection->read_document(doc_id);
+                            Document doc = collection->read_document(doc_id, false);  // Only need content for text indexing
                             if (!doc.content.empty()) {
                                 text_index->index_document(doc_id, doc.content, &update_doc_length);
                             }
@@ -859,6 +962,9 @@ std::vector<uint64_t> Collection::add(const std::vector<std::string>& contents,
             
             // Update btree indices for this document
             update_btree_indices_for_document(doc.id, doc.metadata, false);
+            
+            // Update array indices for this document
+            update_array_indices_for_document(doc.id, doc.metadata, false);
         }
         doc_count_.fetch_add(contents.size());
     }
@@ -987,6 +1093,8 @@ void Collection::update(const std::vector<uint64_t>& ids,
         
         // Remove old metadata from btree indices
         update_btree_indices_for_document(ids[i], old_metadata, true);
+        // Remove old metadata from array indices
+        update_array_indices_for_document(ids[i], old_metadata, true);
         
         // Delete old and write new
         delete_document_internal(ids[i]);
@@ -994,6 +1102,8 @@ void Collection::update(const std::vector<uint64_t>& ids,
         
         // Add new metadata to btree indices
         update_btree_indices_for_document(ids[i], doc.metadata, false);
+        // Add new metadata to array indices
+        update_array_indices_for_document(ids[i], doc.metadata, false);
     }
 }
 
@@ -1005,6 +1115,7 @@ void Collection::delete_docs(const std::vector<uint64_t>& ids) {
         try {
             Document doc = read_document(id);
             update_btree_indices_for_document(id, doc.metadata, true);
+            update_array_indices_for_document(id, doc.metadata, true);
         } catch (...) {
             // Document may not exist - continue with deletion
         }
@@ -1026,6 +1137,7 @@ size_t Collection::delete_docs(const FilterCondition& where) {
         try {
             Document doc = read_document(id);
             update_btree_indices_for_document(id, doc.metadata, true);
+            update_array_indices_for_document(id, doc.metadata, true);
         } catch (...) {
             // Document may not exist - continue with deletion
         }
@@ -1121,7 +1233,7 @@ void Collection::create_hnsw_index(const std::string& name, size_t M, size_t ef_
             try {
                 // Try to read the document to check if it exists
                 // (some IDs might be deleted)
-                Document doc = read_document(doc_id);
+                Document doc = read_document(doc_id, false);  // Just checking existence, no metadata needed
                 
                 // Get vector for this document from document metadata
                 // The vector should be stored when the document was added
@@ -1297,7 +1409,7 @@ void Collection::create_text_index(const std::string& name, const TextIndexConfi
         // Document IDs start at 0
         for (uint64_t doc_id = 0; doc_id < current_doc_count; ++doc_id) {
             try {
-                Document doc = read_document(doc_id);
+                Document doc = read_document(doc_id, false);  // Only need content for text indexing
                 if (!doc.content.empty()) {
                     doc_ids.push_back(doc_id);
                     contents.push_back(std::move(doc.content));
@@ -1620,66 +1732,79 @@ std::vector<SearchResult> Collection::search_vector(
         HNSWIndexBase* hnsw = hnsw_it->second.get();
         
         if (where.has_value()) {
-            // Strategy: Try post-filtering first with increasing over-fetch multipliers.
-            // If that fails to find enough results, fall back to pre-filtering via B-tree.
+            // Selectivity-based adaptive strategy for filtered search
+            // 
+            // 1. Estimate selectivity using histograms
+            // 2. Choose strategy based on selectivity:
+            //    - HIGH selectivity (>10%): Pre-filter + brute force (most docs match, cheaper to scan)
+            //    - MEDIUM selectivity (0.5%-10%): Pre-filter + ACORN filtered HNSW
+            //    - LOW selectivity (≤0.5%): Pre-filter + brute-force for perfect recall
+            //
+            // Note: Post-filtering is ONLY used when no index exists for the filter field,
+            // because for indexed fields, pre-filtering is always more efficient.
             
-            const size_t max_elements = doc_count_.load();
-            const std::vector<size_t> multipliers = {2, 4, 8, 16, 32};
+            ef_search = 300;  // Higher ef_search for filtered searches
+            float selectivity = estimate_selectivity(*where);
             
-            // Boost ef_search for filtered queries to explore more neighbors
-            size_t filtered_ef_search = std::max(ef_search, static_cast<size_t>(200));
+            // Configurable thresholds - lower thresholds to use more brute force for better recall
+            float high_selectivity_threshold = 0.15f;  // 15% - increased for more ACORN usage
+            float low_selectivity_threshold = 0.01f;  // 1% - increased for more brute force at low selectivity
+            if (params.contains("high_selectivity_threshold")) {
+                high_selectivity_threshold = params["high_selectivity_threshold"].get<float>();
+            }
+            if (params.contains("low_selectivity_threshold")) {
+                low_selectivity_threshold = params["low_selectivity_threshold"].get<float>();
+            }
             
-            bool post_filter_succeeded = false;
+            // Debug logging for selectivity estimation
+            CALIBY_LOG_INFO("Collection", "Filtered search: estimated selectivity=", selectivity * 100, 
+                           "% threshold_high=", high_selectivity_threshold * 100, 
+                           "% threshold_low=", low_selectivity_threshold * 100, "%");
             
-            // Phase 1: Post-filtering with progressive over-fetching
-            for (size_t mult_idx = 0; mult_idx < multipliers.size(); ++mult_idx) {
-                size_t search_k = std::min(k * multipliers[mult_idx], max_elements);
-                
-                auto knn_results = hnsw->searchKnn(vector.data(), search_k, filtered_ef_search);
-                results.clear();
-                
-                for (const auto& [dist, node_id] : knn_results) {
-                    uint64_t doc_id = static_cast<uint64_t>(node_id);
-                    
-                    try {
-                        Document doc = read_document(doc_id);
-                        if (!where->evaluate(doc.metadata)) {
-                            continue;  // Skip non-matching documents
-                        }
-                        
-                        SearchResult result;
-                        result.doc_id = doc_id;
-                        result.score = dist;
-                        result.vector_score = dist;
-                        result.document = std::move(doc);
-                        results.push_back(std::move(result));
-                        
-                        if (results.size() >= k) {
-                            break;
-                        }
-                    } catch (...) {
-                        continue;  // Skip documents that can't be read
-                    }
-                }
-                
-                // If we found enough results, we're done with post-filtering
-                if (results.size() >= k) {
-                    post_filter_succeeded = true;
-                    break;
+            // Always try to pre-filter first - it's more efficient than post-filter
+            // Post-filter is only a fallback when evaluate_filter returns empty AND no index exists
+            std::vector<uint64_t> matching_ids = evaluate_filter(*where);
+            
+            // Check if filter uses an indexed field - if so, empty results means no matches
+            // (not "couldn't evaluate"), so we should return empty, not fall back to post-filter
+            bool filter_uses_index = false;
+            if (!where->field.empty()) {
+                if (where->op == FilterOp::CONTAINS && find_array_index_for_field(where->field)) {
+                    filter_uses_index = true;
+                } else if (find_btree_index_for_field(where->field)) {
+                    filter_uses_index = true;
                 }
             }
             
-            // Phase 2: Pre-filtering fallback if post-filtering didn't find enough results
-            if (!post_filter_succeeded && results.size() < k) {
-                // Use evaluate_filter to get all matching document IDs
-                // This does a scan through document pages and evaluates the filter
-                std::vector<uint64_t> matching_ids = evaluate_filter(*where);
+            if (!matching_ids.empty()) {
+                // Pre-filtering succeeded - use appropriate search strategy
+                bool use_brute_force = false;
+                if (selectivity > high_selectivity_threshold) {
+                    // HIGH selectivity: many docs match, use ACORN filtered SEARCH with a large candidate set for best performance
+                    use_brute_force = false;
+                }
+                else if (selectivity <= low_selectivity_threshold) {
+                    // HIGH or LOW selectivity: brute-force for best performance/recall
+                    // - HIGH: many docs match, brute-force is efficient
+                    // - LOW: few docs match, brute-force gives perfect recall
+                    use_brute_force = true;
+                } else {
+                    // MEDIUM selectivity: use filtered HNSW for scalability
+                    // Increase threshold for better recall - brute force is more reliable for moderate-sized candidate sets
+                    size_t brute_force_threshold = 5000;  // Increased from 1000 for better recall
+                    if (params.contains("filter_bruteforce_threshold")) {
+                        brute_force_threshold = params["filter_bruteforce_threshold"].get<size_t>();
+                    }
+                    use_brute_force = (matching_ids.size() <= brute_force_threshold);
+                }
                 
-                if (!matching_ids.empty()) {
-                    // Compute distances to all matching candidates and get top-k
+                CALIBY_LOG_INFO("Collection", "Pre-filter: matching_ids=", matching_ids.size(), 
+                               " use_brute_force=", use_brute_force);
+                
+                if (use_brute_force) {
+                    // BRUTE-FORCE: Compute distances to all candidates
                     auto prefilter_results = hnsw->computeDistances(vector.data(), matching_ids, k);
                     
-                    results.clear();
                     for (const auto& [dist, node_id] : prefilter_results) {
                         uint64_t doc_id = static_cast<uint64_t>(node_id);
                         
@@ -1688,16 +1813,111 @@ std::vector<SearchResult> Collection::search_vector(
                         result.score = dist;
                         result.vector_score = dist;
                         try {
-                            result.document = read_document(doc_id);
-                        } catch (...) {
-                            // Document load failed, still return result
-                        }
+                            result.document = read_document(doc_id, true);  // Include metadata for search results
+                        } catch (...) {}
                         results.push_back(std::move(result));
                         
-                        if (results.size() >= k) {
-                            break;
-                        }
+                        if (results.size() >= k) break;
                     }
+                } else {
+                    // ACORN-STYLE FILTERED HNSW
+                    absl::flat_hash_set<uint32_t> allowed_ids;
+                    allowed_ids.reserve(matching_ids.size());
+                    std::vector<uint32_t> matching_ids_u32;
+                    matching_ids_u32.reserve(matching_ids.size());
+                    for (uint64_t id : matching_ids) {
+                        allowed_ids.insert(static_cast<uint32_t>(id));
+                        matching_ids_u32.push_back(static_cast<uint32_t>(id));
+                    }
+                    
+                    // Debug: Verify matching_ids_u32 is valid before ACORN call
+                    // if (matching_ids_u32.size() > 10000) {
+                    //     CALIBY_LOG_WARN("Collection", "ACORN pre-check: matching_ids_u32.size()=", matching_ids_u32.size(),
+                    //                    " [0]=", matching_ids_u32[0], " [5000]=", matching_ids_u32[5000],
+                    //                    " [10000]=", matching_ids_u32[10000],
+                    //                    " capacity=", matching_ids_u32.capacity());
+                    // }
+
+                    auto filtered_results = hnsw->searchKnnFilteredACORN(
+                        vector.data(), k, ef_search,
+                        [&allowed_ids](uint32_t node_id) {
+                            return allowed_ids.contains(node_id);
+                        },
+                        matching_ids_u32,
+                        selectivity);
+
+                    for (const auto& [dist, node_id] : filtered_results) {
+                        uint64_t doc_id = static_cast<uint64_t>(node_id);
+                        
+                        SearchResult result;
+                        result.doc_id = doc_id;
+                        result.score = dist;
+                        result.vector_score = dist;
+                        try {
+                            result.document = read_document(doc_id, true);  // Include metadata for search results
+                        } catch (...) {}
+                        results.push_back(std::move(result));
+                        
+                        if (results.size() >= k) break;
+                    }
+                }
+            } else if (filter_uses_index) {
+                // Filter used an index but returned empty - no documents match
+                // Return empty results immediately (don't fall back to post-filter)
+                CALIBY_LOG_INFO("Collection", "Pre-filter returned empty for indexed field - no matches");
+                // results is already empty, just return it
+            } else {
+                // FALLBACK: Post-filtering when no pre-filter index exists
+                // This is slow but necessary for unindexed fields
+                CALIBY_LOG_WARN("Collection", "Post-filter fallback: no matching IDs from pre-filter");
+                
+                size_t postfilter_max_k = std::max(k * 100, static_cast<size_t>(1000));
+                if (params.contains("postfilter_max_k")) {
+                    postfilter_max_k = params["postfilter_max_k"].get<size_t>();
+                }
+                double postfilter_growth_factor = 1.5;
+                if (params.contains("postfilter_growth_factor")) {
+                    postfilter_growth_factor = params["postfilter_growth_factor"].get<double>();
+                }
+                if (postfilter_growth_factor < 1.1) {
+                    postfilter_growth_factor = 1.5;
+                }
+
+                size_t current_k = std::max(static_cast<size_t>(1), k);
+                bool satisfied = false;
+                
+                while (!satisfied && current_k <= postfilter_max_k) {
+                    auto knn_results = hnsw->searchKnn(vector.data(), current_k, ef_search);
+
+                    results.clear();
+                    for (const auto& [dist, node_id] : knn_results) {
+                        uint64_t doc_id = static_cast<uint64_t>(node_id);
+
+                        try {
+                            Document doc = read_document(doc_id);
+                            if (!where->evaluate(doc.metadata)) {
+                                continue;
+                            }
+
+                            SearchResult result;
+                            result.doc_id = doc_id;
+                            result.score = dist;
+                            result.vector_score = dist;
+                            result.document = std::move(doc);
+                            results.push_back(std::move(result));
+
+                            if (results.size() >= k) {
+                                satisfied = true;
+                                break;
+                            }
+                        } catch (...) {}
+                    }
+
+                    if (satisfied) break;
+                    
+                    size_t next_k = static_cast<size_t>(current_k * postfilter_growth_factor);
+                    if (next_k <= current_k) next_k = current_k + 1;
+                    current_k = std::min(postfilter_max_k, next_k);
                 }
             }
         } else {
@@ -1712,7 +1932,7 @@ std::vector<SearchResult> Collection::search_vector(
                 result.score = dist;
                 result.vector_score = dist;
                 try {
-                    result.document = read_document(doc_id);
+                    result.document = read_document(doc_id, true);  // Include metadata for search results
                 } catch (...) {
                     // Document load failed, still return result
                 }
@@ -1794,7 +2014,7 @@ std::vector<SearchResult> Collection::search_text(
         
         // Load document
         try {
-            result.document = read_document(doc_id);
+            result.document = read_document(doc_id, true);  // Include metadata for search results
         } catch (...) {
             // Document load failed, still return result
         }
@@ -2292,7 +2512,7 @@ void Collection::write_document(const Document& doc) {
     id_index_insert(doc.id, target_page, slot_num);
 }
 
-Document Collection::read_document(uint64_t doc_id) {
+Document Collection::read_document(uint64_t doc_id, bool parse_metadata) {
     // Lookup in ID index to get (page_id, slot)
     auto location = id_index_lookup(doc_id);
     if (!location) {
@@ -2336,19 +2556,37 @@ Document Collection::read_document(uint64_t doc_id) {
     // Calculate total data size
     size_t total_data_size = header->content_length + header->metadata_length;
     
-    // Read all data (may span multiple pages for overflow docs)
+    // Calculate inline data capacity
+    size_t inline_capacity = slot.length - sizeof(DocumentRecordHeader);
+    
+    // Fast path: all data is inline (no overflow pages)
+    // Avoid intermediate vector allocation by copying directly to doc.content
+    if (header->overflow_page == 0 && total_data_size <= inline_capacity) {
+        const char* data_ptr = reinterpret_cast<const char*>(header + 1);
+        
+        // Copy content directly
+        doc.content.assign(data_ptr, header->content_length);
+        
+        // Parse metadata if needed
+        if (parse_metadata && header->metadata_length > 0) {
+            std::string_view meta_str(data_ptr + header->content_length, header->metadata_length);
+            doc.metadata = nlohmann::json::parse(meta_str);
+        }
+        
+        return doc;
+    }
+    
+    // Slow path: data spans overflow pages - need to collect all data first
     std::vector<uint8_t> all_data;
     all_data.reserve(total_data_size);
     
-    // Calculate inline data capacity
-    size_t inline_capacity = slot.length - sizeof(DocumentRecordHeader);
     size_t bytes_in_first = std::min(total_data_size, inline_capacity);
     
     // Read from inline portion
     const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(header + 1);
     all_data.insert(all_data.end(), data_ptr, data_ptr + bytes_in_first);
     
-    // Read from overflow pages if needed
+    // Read from overflow pages
     PID next_overflow = header->overflow_page;
     while (next_overflow != 0 && all_data.size() < total_data_size) {
         GuardO<Page> overflow_page(next_overflow);
@@ -2365,9 +2603,11 @@ Document Collection::read_document(uint64_t doc_id) {
     doc.content = std::string(reinterpret_cast<const char*>(all_data.data()), 
                                header->content_length);
     
-    std::string meta_str(reinterpret_cast<const char*>(all_data.data() + header->content_length), 
-                         header->metadata_length);
-    doc.metadata = nlohmann::json::parse(meta_str);
+    if (parse_metadata) {
+        std::string meta_str(reinterpret_cast<const char*>(all_data.data() + header->content_length), 
+                             header->metadata_length);
+        doc.metadata = nlohmann::json::parse(meta_str);
+    }
     
     return doc;
 }
@@ -2541,7 +2781,30 @@ std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter)
     // Debug: Log btree index lookup attempt
     CALIBY_LOG_DEBUG("Collection", "evaluate_filter: field='", filter.field, 
                     "', op=", static_cast<int>(filter.op), 
-                    ", btree_indices_.size()=", btree_indices_.size());
+                    ", btree_indices_.size()=", btree_indices_.size(),
+                    ", array_indices_.size()=", array_indices_.size());
+    
+    // Try to use array index for CONTAINS operation on indexed array fields
+    if (!filter.field.empty() && filter.op == FilterOp::CONTAINS) {
+        ArrayIndex* array_idx = find_array_index_for_field(filter.field);
+        
+        CALIBY_LOG_DEBUG("Collection", "evaluate_filter: find_array_index_for_field('", 
+                        filter.field, "') returned ", (array_idx ? "non-null" : "null"));
+        
+        if (array_idx) {
+            // Extract the value to search for
+            return std::visit([array_idx](auto&& v) -> std::vector<uint64_t> {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, std::string>) {
+                    return array_idx->lookup(v);
+                } else if constexpr (std::is_same_v<T, int64_t>) {
+                    return array_idx->lookup(v);
+                } else {
+                    return {};
+                }
+            }, filter.value);
+        }
+    }
     
     // Try to use B-tree index for simple conditions on indexed fields
     if (!filter.field.empty()) {
@@ -2576,23 +2839,143 @@ std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter)
                         return btree_idx->less_than(*btree_key, true);
                     }
                     default:
-                        // NE, IN, NIN, CONTAINS - fall through to scan
+                        // NE, IN, NIN - fall through to scan
                         break;
                 }
             }
         }
     }
     
-    // Handle AND/OR with btree optimization where possible
+    // Handle AND/OR with btree/array index optimization where possible
     if (filter.op == FilterOp::AND && !filter.children.empty()) {
-        // For AND, we can use btree for any indexed child, then filter the rest
-        // Find the most selective btree-indexed condition
+        // OPTIMIZATION: Check for range query pattern (GT/GTE + LT/LTE on same field)
+        // This is much more efficient than two separate scans + intersection
+        
+        // Recursively flatten nested ANDs to find all range conditions
+        std::unordered_map<std::string, std::vector<const FilterCondition*>> field_conditions;
+        std::vector<const FilterCondition*> other_conditions_flat;
+        
+        std::function<void(const FilterCondition&)> collect_conditions;
+        collect_conditions = [&](const FilterCondition& cond) {
+            if (cond.op == FilterOp::AND) {
+                // Flatten nested AND
+                for (const auto& child : cond.children) {
+                    collect_conditions(child);
+                }
+            } else if (!cond.field.empty() && 
+                       (cond.op == FilterOp::GT || cond.op == FilterOp::GTE ||
+                        cond.op == FilterOp::LT || cond.op == FilterOp::LTE)) {
+                // Range condition on a field
+                field_conditions[cond.field].push_back(&cond);
+            } else {
+                // Other condition
+                other_conditions_flat.push_back(&cond);
+            }
+        };
+        
+        for (const auto& child : filter.children) {
+            collect_conditions(child);
+        }
+        
+        // Check each field for range query optimization opportunity
+        for (auto& [field_name, conditions] : field_conditions) {
+            if (conditions.size() >= 2) {
+                // Look for GT/GTE and LT/LTE pair
+                const FilterCondition* lower = nullptr;
+                const FilterCondition* upper = nullptr;
+                bool lower_inclusive = false;
+                bool upper_inclusive = false;
+                
+                for (const auto* cond : conditions) {
+                    if (cond->op == FilterOp::GT) { lower = cond; lower_inclusive = false; }
+                    else if (cond->op == FilterOp::GTE) { lower = cond; lower_inclusive = true; }
+                    else if (cond->op == FilterOp::LT) { upper = cond; upper_inclusive = false; }
+                    else if (cond->op == FilterOp::LTE) { upper = cond; upper_inclusive = true; }
+                }
+                
+                if (lower && upper) {
+                    // Found range query pattern - use btree range_scan
+                    BTreeMetadataIndex* btree_idx = find_btree_index_for_field(field_name);
+                    if (btree_idx) {
+                        auto lower_key = filter_value_to_btree_key(*lower);
+                        auto upper_key = filter_value_to_btree_key(*upper);
+                        
+                        if (lower_key && upper_key) {
+                            // Use efficient range scan
+                            auto range_iter = btree_idx->range_scan(
+                                lower_key, upper_key, 
+                                lower_inclusive, upper_inclusive);
+                            
+                            // Collect all results from range iterator
+                            std::vector<uint64_t> result = range_iter.collect();
+                            
+                            // Filter by any remaining conditions not part of the range
+                            std::vector<const FilterCondition*> other_conditions;
+                            for (const auto& child : filter.children) {
+                                if (&child != lower && &child != upper) {
+                                    other_conditions.push_back(&child);
+                                }
+                            }
+                            
+                            if (!other_conditions.empty()) {
+                                std::vector<uint64_t> final_result;
+                                for (uint64_t doc_id : result) {
+                                    try {
+                                        Document doc = read_document(doc_id);
+                                        bool passes = true;
+                                        for (const auto* cond : other_conditions) {
+                                            if (!cond->evaluate(doc.metadata)) {
+                                                passes = false;
+                                                break;
+                                            }
+                                        }
+                                        if (passes) {
+                                            final_result.push_back(doc_id);
+                                        }
+                                    } catch (...) {
+                                        // Skip documents that can't be read
+                                    }
+                                }
+                                return final_result;
+                            }
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fall back to original AND handling
+        // For AND, we can use btree/array index for any indexed child, then filter the rest
+        // Find the most selective indexed condition
         std::vector<uint64_t> result;
-        bool have_btree_result = false;
+        bool have_index_result = false;
         std::vector<const FilterCondition*> remaining_conditions;
         
         for (const auto& child : filter.children) {
             if (!child.field.empty()) {
+                // Check for array index on CONTAINS operations first
+                if (child.op == FilterOp::CONTAINS) {
+                    ArrayIndex* array_idx = find_array_index_for_field(child.field);
+                    if (array_idx) {
+                        if (!have_index_result) {
+                            result = evaluate_filter(child);
+                            have_index_result = true;
+                        } else {
+                            auto other = evaluate_filter(child);
+                            std::sort(result.begin(), result.end());
+                            std::sort(other.begin(), other.end());
+                            std::vector<uint64_t> intersection;
+                            std::set_intersection(result.begin(), result.end(),
+                                                other.begin(), other.end(),
+                                                std::back_inserter(intersection));
+                            result = std::move(intersection);
+                        }
+                        continue;
+                    }
+                }
+                
+                // Check for btree index on scalar operations
                 BTreeMetadataIndex* btree_idx = find_btree_index_for_field(child.field);
                 auto btree_key = filter_value_to_btree_key(child);
                 
@@ -2601,10 +2984,10 @@ std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter)
                      child.op == FilterOp::GTE || child.op == FilterOp::LT || 
                      child.op == FilterOp::LTE)) {
                     
-                    if (!have_btree_result) {
+                    if (!have_index_result) {
                         // Use first btree-indexed condition as base
                         result = evaluate_filter(child);
-                        have_btree_result = true;
+                        have_index_result = true;
                     } else {
                         // Intersect with additional btree results
                         auto other = evaluate_filter(child);
@@ -2622,7 +3005,7 @@ std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter)
             remaining_conditions.push_back(&child);
         }
         
-        if (have_btree_result) {
+        if (have_index_result) {
             // Filter remaining conditions by scanning matched docs
             if (!remaining_conditions.empty()) {
                 std::vector<uint64_t> final_result;
@@ -2659,6 +3042,44 @@ std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter)
         // Remove duplicates
         std::sort(result.begin(), result.end());
         result.erase(std::unique(result.begin(), result.end()), result.end());
+        return result;
+    }
+    
+    if (filter.op == FilterOp::NOT && !filter.children.empty()) {
+        // For NOT, get all doc IDs and subtract the inner condition's matches
+        auto inner_matches = evaluate_filter(filter.children[0]);
+        std::unordered_set<uint64_t> inner_set(inner_matches.begin(), inner_matches.end());
+        
+        // Scan all documents and collect those NOT in inner_matches
+        std::vector<uint64_t> result;
+        constexpr size_t page_hdr_size = sizeof(DocumentPageHeader);
+        PID cur_page = doc_pages_head_;
+        
+        while (cur_page != 0) {
+            try {
+                GuardO<Page> page(cur_page);
+                auto* page_hdr = reinterpret_cast<const DocumentPageHeader*>(page.ptr);
+                auto* slots = reinterpret_cast<const SlotEntry*>(
+                    reinterpret_cast<const uint8_t*>(page.ptr) + page_hdr_size);
+                
+                for (uint16_t slot_num = 0; slot_num < page_hdr->slot_count; ++slot_num) {
+                    const SlotEntry& slot = slots[slot_num];
+                    if (slot.is_deleted()) continue;
+                    
+                    auto* header = reinterpret_cast<const DocumentRecordHeader*>(
+                        reinterpret_cast<const uint8_t*>(page.ptr) + slot.offset);
+                    uint64_t doc_id = header->doc_id;
+                    
+                    // Include if NOT in inner matches
+                    if (inner_set.find(doc_id) == inner_set.end()) {
+                        result.push_back(doc_id);
+                    }
+                }
+                cur_page = page_hdr->next_page;
+            } catch (...) {
+                break;
+            }
+        }
         return result;
     }
     
@@ -2722,43 +3143,278 @@ std::vector<uint64_t> Collection::evaluate_filter(const FilterCondition& filter)
     return matching_ids;
 }
 
-float Collection::estimate_selectivity(const FilterCondition& filter) {
-    // Simple heuristic for selectivity estimation
-    // TODO: Use statistics and histogram
+uint64_t Collection::estimate_cardinality(const FilterCondition& filter) const {
+    // Use histogram-based cardinality estimation for better accuracy
+    uint64_t total_docs = doc_count_.load();
+    if (total_docs == 0) return 0;
     
     switch (filter.op) {
-        case FilterOp::EQ:
-            return 0.1f;  // 10% selectivity for equality
-        case FilterOp::NE:
-            return 0.9f;
+        case FilterOp::EQ: {
+            // Try to find btree index for this field
+            BTreeMetadataIndex* btree = find_btree_index_for_field(filter.field);
+            if (btree) {
+                auto btree_key = metadata_value_to_btree_key(filter.value);
+                if (btree_key) {
+                    return btree->histogram().estimate_eq(*btree_key);
+                }
+            }
+            // Conservative fallback: assume 1% selectivity
+            // This ensures we use pre-filtering for better recall
+            return total_docs / 100;
+        }
+        
+        case FilterOp::NE: {
+            // NOT equal - complement of EQ
+            BTreeMetadataIndex* btree = find_btree_index_for_field(filter.field);
+            if (btree) {
+                auto btree_key = metadata_value_to_btree_key(filter.value);
+                if (btree_key) {
+                    uint64_t eq_count = btree->histogram().estimate_eq(*btree_key);
+                    return total_docs > eq_count ? total_docs - eq_count : 0;
+                }
+            }
+            // Fallback: assume 90% selectivity
+            return total_docs * 9 / 10;
+        }
+        
         case FilterOp::GT:
-        case FilterOp::GTE:
+        case FilterOp::GTE: {
+            BTreeMetadataIndex* btree = find_btree_index_for_field(filter.field);
+            if (btree) {
+                auto btree_key = metadata_value_to_btree_key(filter.value);
+                if (btree_key) {
+                    bool inclusive = (filter.op == FilterOp::GTE);
+                    return btree->histogram().estimate_range(btree_key, std::nullopt, inclusive, true);
+                }
+            }
+            // Fallback: assume 30% selectivity
+            return total_docs * 3 / 10;
+        }
+        
         case FilterOp::LT:
-        case FilterOp::LTE:
-            return 0.3f;  // 30% for range
-        case FilterOp::IN:
-            return 0.2f;
-        case FilterOp::NIN:
-            return 0.8f;
-        case FilterOp::CONTAINS:
-            return 0.1f;
+        case FilterOp::LTE: {
+            BTreeMetadataIndex* btree = find_btree_index_for_field(filter.field);
+            if (btree) {
+                auto btree_key = metadata_value_to_btree_key(filter.value);
+                if (btree_key) {
+                    bool inclusive = (filter.op == FilterOp::LTE);
+                    return btree->histogram().estimate_range(std::nullopt, btree_key, true, inclusive);
+                }
+            }
+            // Fallback: assume 30% selectivity
+            return total_docs * 3 / 10;
+        }
+        
+        case FilterOp::IN: {
+            // IN (v1, v2, ...) - sum of equality estimates
+            // Value can be std::vector<std::string> or std::vector<int64_t>
+            BTreeMetadataIndex* btree = find_btree_index_for_field(filter.field);
+            if (btree) {
+                std::vector<BTreeKey> keys;
+                
+                if (std::holds_alternative<std::vector<std::string>>(filter.value)) {
+                    const auto& values = std::get<std::vector<std::string>>(filter.value);
+                    keys.reserve(values.size());
+                    for (const auto& v : values) {
+                        keys.push_back(BTreeKey(v));
+                    }
+                } else if (std::holds_alternative<std::vector<int64_t>>(filter.value)) {
+                    const auto& values = std::get<std::vector<int64_t>>(filter.value);
+                    keys.reserve(values.size());
+                    for (int64_t v : values) {
+                        keys.push_back(BTreeKey(v));
+                    }
+                }
+                
+                if (!keys.empty()) {
+                    return btree->histogram().estimate_in(keys);
+                }
+            }
+            // Fallback: assume 20% selectivity
+            return total_docs / 5;
+        }
+        
+        case FilterOp::NIN: {
+            // NOT IN - complement of IN
+            BTreeMetadataIndex* btree = find_btree_index_for_field(filter.field);
+            if (btree) {
+                std::vector<BTreeKey> keys;
+                
+                if (std::holds_alternative<std::vector<std::string>>(filter.value)) {
+                    const auto& values = std::get<std::vector<std::string>>(filter.value);
+                    keys.reserve(values.size());
+                    for (const auto& v : values) {
+                        keys.push_back(BTreeKey(v));
+                    }
+                } else if (std::holds_alternative<std::vector<int64_t>>(filter.value)) {
+                    const auto& values = std::get<std::vector<int64_t>>(filter.value);
+                    keys.reserve(values.size());
+                    for (int64_t v : values) {
+                        keys.push_back(BTreeKey(v));
+                    }
+                }
+                
+                if (!keys.empty()) {
+                    uint64_t in_count = btree->histogram().estimate_in(keys);
+                    return total_docs > in_count ? total_docs - in_count : 0;
+                }
+            }
+            // Fallback: assume 80% selectivity
+            return total_docs * 4 / 5;
+        }
+        
+        case FilterOp::CONTAINS: {
+            // Array contains - try to use array index for accurate estimate
+            ArrayIndex* arr_idx = find_array_index_for_field(filter.field);
+            if (arr_idx) {
+                // Try to look up the actual posting list size
+                try {
+                    std::vector<uint64_t> matches;
+                    if (std::holds_alternative<std::string>(filter.value)) {
+                        matches = arr_idx->lookup(std::get<std::string>(filter.value));
+                    } else if (std::holds_alternative<int64_t>(filter.value)) {
+                        matches = arr_idx->lookup(std::get<int64_t>(filter.value));
+                    }
+                    // Return actual count from posting list
+                    return matches.size();
+                } catch (...) {
+                    // Fallback on error
+                }
+            }
+            // Conservative fallback: assume 1% selectivity (most array element matches are sparse)
+            // This ensures we use pre-filtering instead of expensive post-filtering
+            return total_docs / 100;
+        }
+        
         case FilterOp::AND: {
-            float sel = 1.0f;
+            // Assume independence and multiply selectivities
+            // First, try to detect bounded range queries on the same field
+            // e.g., {$and: [{field: {$gt: X}}, {field: {$lt: Y}}]}
+            // This is common and should be estimated using histogram.estimate_range(X, Y)
+            
+            // Group conditions by field (recursively flatten nested ANDs)
+            std::unordered_map<std::string, std::vector<const FilterCondition*>> field_conditions;
+            std::vector<const FilterCondition*> other_conditions;
+            
+            std::function<void(const FilterCondition&)> collect_range_conditions;
+            collect_range_conditions = [&](const FilterCondition& cond) {
+                if (cond.op == FilterOp::AND) {
+                    for (const auto& child : cond.children) {
+                        collect_range_conditions(child);
+                    }
+                } else if (cond.op == FilterOp::GT || cond.op == FilterOp::GTE ||
+                           cond.op == FilterOp::LT || cond.op == FilterOp::LTE) {
+                    field_conditions[cond.field].push_back(&cond);
+                } else {
+                    other_conditions.push_back(&cond);
+                }
+            };
+            
             for (const auto& child : filter.children) {
-                sel *= estimate_selectivity(child);
+                collect_range_conditions(child);
             }
-            return sel;
+            
+            uint64_t estimate = total_docs;
+            std::unordered_set<const FilterCondition*> handled;
+            
+            // Handle bounded range queries efficiently
+            for (const auto& [field, conds] : field_conditions) {
+                const FilterCondition* lower = nullptr;
+                const FilterCondition* upper = nullptr;
+                bool lower_inclusive = false;
+                bool upper_inclusive = false;
+                
+                for (const FilterCondition* c : conds) {
+                    if (c->op == FilterOp::GT || c->op == FilterOp::GTE) {
+                        if (!lower) {
+                            lower = c;
+                            lower_inclusive = (c->op == FilterOp::GTE);
+                        }
+                    } else if (c->op == FilterOp::LT || c->op == FilterOp::LTE) {
+                        if (!upper) {
+                            upper = c;
+                            upper_inclusive = (c->op == FilterOp::LTE);
+                        }
+                    }
+                }
+                
+                // If we have both lower and upper bound, use bounded range estimate
+                if (lower && upper) {
+                    BTreeMetadataIndex* btree = find_btree_index_for_field(field);
+                    if (btree) {
+                        auto lower_key = metadata_value_to_btree_key(lower->value);
+                        auto upper_key = metadata_value_to_btree_key(upper->value);
+                        if (lower_key && upper_key) {
+                            uint64_t range_card = btree->histogram().estimate_range(
+                                lower_key, upper_key, lower_inclusive, upper_inclusive);
+                            double sel = static_cast<double>(range_card) / total_docs;
+                            estimate = static_cast<uint64_t>(estimate * sel);
+                            handled.insert(lower);
+                            handled.insert(upper);
+                        }
+                    } else {
+                        // No btree index - use conservative estimate (5% for bounded range)
+                        estimate = static_cast<uint64_t>(estimate * 0.05);
+                        handled.insert(lower);
+                        handled.insert(upper);
+                    }
+                }
+            }
+            
+            // Process remaining range conditions not part of bounded ranges
+            for (const auto& [field, conds] : field_conditions) {
+                for (const FilterCondition* c : conds) {
+                    if (handled.count(c)) continue;
+                    uint64_t child_card = estimate_cardinality(*c);
+                    double sel = static_cast<double>(child_card) / total_docs;
+                    estimate = static_cast<uint64_t>(estimate * sel);
+                    handled.insert(c);
+                }
+            }
+            
+            // Process other (non-range) conditions
+            for (const FilterCondition* c : other_conditions) {
+                uint64_t child_card = estimate_cardinality(*c);
+                double sel = static_cast<double>(child_card) / total_docs;
+                estimate = static_cast<uint64_t>(estimate * sel);
+            }
+            
+            return std::max(estimate, static_cast<uint64_t>(1));
         }
+        
         case FilterOp::OR: {
-            float sel = 0.0f;
+            // Use inclusion-exclusion principle (simplified)
+            // For simplicity, use max(children) + partial sum heuristic
+            uint64_t max_card = 0;
+            uint64_t sum_card = 0;
             for (const auto& child : filter.children) {
-                sel += estimate_selectivity(child);
+                uint64_t child_card = estimate_cardinality(child);
+                max_card = std::max(max_card, child_card);
+                sum_card += child_card;
             }
-            return std::min(sel, 1.0f);
+            // Heuristic: average of max and sum, capped at total
+            return std::min((max_card + sum_card) / 2, total_docs);
         }
+        
+        case FilterOp::NOT: {
+            // Estimate NOT as total - inner cardinality
+            if (filter.children.empty()) return total_docs;
+            uint64_t child_card = estimate_cardinality(filter.children[0]);
+            return (child_card >= total_docs) ? 0 : total_docs - child_card;
+        }
+        
         default:
-            return 0.5f;
+            return total_docs / 2;
     }
+}
+
+float Collection::estimate_selectivity(const FilterCondition& filter) {
+    // Use histogram-based cardinality estimation
+    uint64_t total_docs = doc_count_.load();
+    if (total_docs == 0) return 0.0f;
+    
+    uint64_t cardinality = estimate_cardinality(filter);
+    return static_cast<float>(cardinality) / static_cast<float>(total_docs);
 }
 
 BTreeMetadataIndex* Collection::find_btree_index_for_field(const std::string& field_name) const {
@@ -2794,6 +3450,223 @@ void Collection::update_btree_indices_for_document(uint64_t doc_id, const nlohma
             CALIBY_LOG_WARN("Collection", "Failed to update btree index '", index_name, 
                           "' for doc ", doc_id, ": ", e.what());
         }
+    }
+}
+
+ArrayIndex* Collection::find_array_index_for_field(const std::string& field_name) const {
+    // Search through all array indices to find one that indexes the given field
+    auto it = array_indices_.find(field_name);
+    if (it != array_indices_.end() && it->second) {
+        return it->second.get();
+    }
+    return nullptr;
+}
+
+void Collection::update_array_indices_for_document(uint64_t doc_id, const nlohmann::json& metadata, bool is_delete) {
+    // Update all array indices with this document's metadata
+    for (const auto& [field_name, array_idx] : array_indices_) {
+        if (!array_idx) continue;
+        
+        try {
+            if (is_delete) {
+                // Mark document as deleted in this array index
+                if (metadata.contains(field_name)) {
+                    const auto& field_value = metadata.at(field_name);
+                    if (field_value.is_array()) {
+                        array_idx->remove_document(doc_id);
+                    }
+                }
+            } else {
+                // Always clear tombstone first, regardless of whether this index contains this doc
+                // (the document may have been deleted and is now being re-added)
+                array_idx->undelete_document(doc_id);
+                
+                // Then index if the metadata contains this field
+                if (metadata.contains(field_name)) {
+                    const auto& field_value = metadata.at(field_name);
+                    if (!field_value.is_array()) continue;
+                    
+                    // Extract elements based on type
+                    if (array_idx->element_type() == ArrayElementType::STRING) {
+                        std::vector<std::string> elements;
+                        for (const auto& elem : field_value) {
+                            if (elem.is_string()) {
+                                elements.push_back(elem.get<std::string>());
+                            }
+                        }
+                        if (!elements.empty()) {
+                            array_idx->index_document(doc_id, elements);
+                        }
+                    } else if (array_idx->element_type() == ArrayElementType::INT) {
+                        std::vector<int64_t> elements;
+                        for (const auto& elem : field_value) {
+                            if (elem.is_number_integer()) {
+                                elements.push_back(elem.get<int64_t>());
+                            }
+                        }
+                        if (!elements.empty()) {
+                            array_idx->index_document(doc_id, elements);
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            CALIBY_LOG_WARN("Collection", "Failed to update array index for field '", field_name, 
+                          "' doc ", doc_id, ": ", e.what());
+        }
+    }
+}
+
+void Collection::create_array_index(const std::string& name, const std::string& field_name) {
+    std::unique_lock lock(mutex_);
+    
+    // Check if index already exists
+    if (indices_.find(name) != indices_.end()) {
+        throw std::runtime_error("Index '" + name + "' already exists");
+    }
+    
+    // Verify field exists and is an array type
+    const FieldDef* field_def = schema_.get_field(field_name);
+    if (!field_def) {
+        throw std::runtime_error("Field '" + field_name + "' not found in schema");
+    }
+    
+    ArrayElementType element_type;
+    if (field_def->type == FieldType::STRING_ARRAY) {
+        element_type = ArrayElementType::STRING;
+    } else if (field_def->type == FieldType::INT_ARRAY) {
+        element_type = ArrayElementType::INT;
+    } else {
+        throw std::runtime_error("Field '" + field_name + "' is not an array type (STRING_ARRAY or INT_ARRAY)");
+    }
+    
+    // Create full index name for catalog
+    std::string full_name = name_ + "_" + name;
+    
+    // Create through catalog
+    IndexCatalog& catalog = IndexCatalog::instance();
+    IndexHandle handle;
+    bool recovering = false;
+    
+    if (catalog.index_exists(full_name)) {
+        handle = catalog.open_index(full_name);
+        recovering = true;
+        CALIBY_LOG_INFO("Collection", "Recovering array index '", name, "' for field '", field_name, "'");
+    } else {
+        // Create new index entry in catalog
+        // For array index, we use a special type "array" 
+        handle = catalog.create_btree_index(full_name, {field_name}, false);
+    }
+    
+    // Create index info
+    CollectionIndexInfo info;
+    info.index_id = handle.index_id();
+    info.name = name;
+    info.type = "array";
+    info.status = "ready";
+    info.config = {
+        {"field", field_name},
+        {"element_type", element_type == ArrayElementType::STRING ? "string" : "int"}
+    };
+    
+    indices_[name] = info;
+    
+    // Create the actual ArrayIndex object
+    try {
+        auto array_idx = std::make_unique<ArrayIndex>(
+            collection_id_, handle.index_id(), field_name, element_type);
+        
+        // Populate index with existing documents
+        // Release the lock before iterating through documents to avoid deadlock
+        uint64_t docs_to_index = doc_count_.load();
+        if (docs_to_index > 0 && !recovering) {
+            CALIBY_LOG_INFO("Collection", "Populating array index '", name, "' with existing documents...");
+            
+            // Release the lock for document reading
+            lock.unlock();
+            
+            uint64_t indexed_count = 0;
+            
+            // We need to iterate through all documents - use the document pages
+            constexpr size_t page_header_size = sizeof(DocumentPageHeader);
+            PID current_page = doc_pages_head_;
+            
+            while (current_page != 0) {
+                PID next_page = 0;
+                std::vector<uint64_t> doc_ids_to_index;
+                
+                // First pass: collect all doc_ids from this page
+                {
+                    GuardO<Page> page(current_page);
+                    auto* page_header = reinterpret_cast<const DocumentPageHeader*>(page.ptr);
+                    auto* slots = reinterpret_cast<const SlotEntry*>(
+                        reinterpret_cast<const uint8_t*>(page.ptr) + page_header_size);
+                    
+                    next_page = page_header->next_page;
+                    uint16_t slot_count = page_header->slot_count;
+                    
+                    for (uint16_t slot_num = 0; slot_num < slot_count; ++slot_num) {
+                        const SlotEntry& slot = slots[slot_num];
+                        if (slot.is_deleted()) continue;
+                        
+                        auto* rec_header = reinterpret_cast<const DocumentRecordHeader*>(
+                            reinterpret_cast<const uint8_t*>(page.ptr) + slot.offset);
+                        doc_ids_to_index.push_back(rec_header->doc_id);
+                    }
+                }  // Page guard released here
+                
+                // Second pass: index each document (no page guard held)
+                for (uint64_t doc_id : doc_ids_to_index) {
+                    try {
+                        Document doc = read_document(doc_id);
+                        if (doc.metadata.contains(field_name)) {
+                            const auto& field_value = doc.metadata[field_name];
+                            if (field_value.is_array()) {
+                                if (element_type == ArrayElementType::STRING) {
+                                    std::vector<std::string> elements;
+                                    for (const auto& elem : field_value) {
+                                        if (elem.is_string()) {
+                                            elements.push_back(elem.get<std::string>());
+                                        }
+                                    }
+                                    if (!elements.empty()) {
+                                        array_idx->index_document(doc_id, elements);
+                                        indexed_count++;
+                                    }
+                                } else {
+                                    std::vector<int64_t> elements;
+                                    for (const auto& elem : field_value) {
+                                        if (elem.is_number_integer()) {
+                                            elements.push_back(elem.get<int64_t>());
+                                        }
+                                    }
+                                    if (!elements.empty()) {
+                                        array_idx->index_document(doc_id, elements);
+                                        indexed_count++;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (...) {
+                        // Skip documents that can't be read
+                    }
+                }
+                
+                current_page = next_page;
+            }
+            
+            CALIBY_LOG_INFO("Collection", "Indexed ", indexed_count, " documents in array index '", name, "'");
+            
+            // Re-acquire lock before modifying array_indices_
+            lock.lock();
+        }
+        
+        array_indices_[field_name] = std::move(array_idx);
+        CALIBY_LOG_INFO("Collection", "Created array index '", name, "' for field '", field_name, "'");
+        
+    } catch (const std::exception& e) {
+        CALIBY_LOG_WARN("Collection", "Could not create array index '", name, "': ", e.what());
+        throw;
     }
 }
 

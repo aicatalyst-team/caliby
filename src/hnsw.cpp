@@ -13,7 +13,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -212,39 +214,23 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
             meta_guard->base_pid = -1;
             meta_guard->max_elements = max_elements;
             meta_guard->node_count.store(0);
-            meta_guard->alloc_count.store(1, std::memory_order_relaxed);
+            meta_guard->alloc_count.store(0, std::memory_order_relaxed);  // Start with 0 pages allocated
             meta_guard->enter_point_node_id = HNSWMetadataPage::invalid_node_id;
             meta_guard->max_level.store(0);
 
-            u64 total_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
-            if (total_pages > 0) {
-                AllocGuard<HNSWPage> first_page_guard(allocator_);
-                meta_guard->base_pid = first_page_guard.pid;  // Already a global PID
-                first_page_guard->dirty = false;
-                first_page_guard->node_count = 0;
-                first_page_guard->dirty = true;
-
-                PID expected_pid = meta_guard->base_pid + 1;
-                for (u64 i = 1; i < total_pages; ++i) {
-                    AllocGuard<HNSWPage> page_guard(allocator_);
-                    // Verify contiguous allocation
-                    if (page_guard.pid != expected_pid) {
-                        CALIBY_LOG_ERROR("HNSW", "Recovery: Non-contiguous page allocation! Expected PID ",
-                                  expected_pid, " but got ", page_guard.pid);
-                        CALIBY_LOG_ERROR("HNSW", "Recovery: This breaks the assumption that pages are at base_pid + offset");
-                        throw std::runtime_error("Non-contiguous HNSW page allocation");
-                    }
-                    page_guard->dirty = false;
-                    page_guard->node_count = 0;
-                    page_guard->dirty = true;
-                    expected_pid++;
-                }
-            }
+            // Allocate ONLY the first page for now - pages will be allocated on-demand
+            // when vectors are added. This avoids pre-allocating 10M pages for large max_elements.
+            AllocGuard<HNSWPage> first_page_guard(allocator_);
+            meta_guard->base_pid = first_page_guard.pid;  // Already a global PID
+            first_page_guard->dirty = false;
+            first_page_guard->node_count = 0;
+            first_page_guard->dirty = true;
+            meta_guard->alloc_count.store(1, std::memory_order_relaxed);  // 1 page allocated
 
             this->base_pid = meta_guard->base_pid;
             meta_guard->dirty = true;
             CALIBY_LOG_INFO("HNSW", "Recovery: Allocated new metadata page ", this->metadata_pid,
-                      " base_pid=", this->base_pid, " total_pages=", total_pages);
+                      " base_pid=", this->base_pid, " (pages allocated on-demand)");
 
             // Explicitly release old guard before acquiring new one to avoid double-lock
             // Re-acquire global metadata page guard (was released at line 198)
@@ -717,9 +703,59 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::selectNeighborsHeuristi
 template <typename DistanceMetric>
 void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id) {
     const u32 new_node_level = getRandomLevel();
-    PID new_node_pid = getNodePID(new_node_id);
     // Get IndexTranslationArray once for this index to avoid TLS lookups in tight loop
     IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
+
+    // --- 0. Ensure the page for this node exists (on-demand allocation) ---
+    u64 required_page_num = new_node_id / NodesPerPage;
+    {
+        // Check if we need to allocate more pages
+        GuardX<HNSWMetadataPage> meta_guard(metadata_pid);
+        u64 current_alloc_count = meta_guard->alloc_count.load(std::memory_order_acquire);
+        
+        if (required_page_num >= current_alloc_count) {
+            // Need to initialize pages from current_alloc_count up to required_page_num (inclusive)
+            // We DON'T use AllocGuard here because after recovery, the allocator counter
+            // may be at a different position. Instead, we directly access pages by their
+            // computed PID (base_pid + page_idx). The buffer manager will create the page
+            // if it doesn't exist (readPage handles missing pages by zeroing them).
+            for (u64 page_idx = current_alloc_count; page_idx <= required_page_num; ++page_idx) {
+                PID page_pid = base_pid + page_idx;
+                
+                // Access the page directly - this will create it if it doesn't exist
+                GuardX<HNSWPage> new_page_guard(page_pid);
+                
+                // Initialize the new page
+                new_page_guard->node_count = 0;
+                new_page_guard->dirty = true;
+            }
+            
+            // Update alloc_count to include all newly allocated pages
+            u64 new_alloc_count = required_page_num + 1;
+            meta_guard->alloc_count.store(new_alloc_count, std::memory_order_release);
+            meta_guard->dirty = true;
+            
+            // CRITICAL: Also update IndexTranslationArray::allocCount so flushAll knows
+            // about these pages. Without this, pages won't be flushed on close!
+            // The base_pid encodes index_id in high bits and local PID 2 in low bits.
+            // We need to update the allocCount to be: (number of metadata pages) + (number of data pages)
+            // base_pid local part + new_alloc_count gives us the next local PID to use
+            u64 base_local_pid = base_pid & 0xFFFFFFFF;  // Extract local PID from base_pid
+            u64 total_local_pages = base_local_pid + new_alloc_count;  // Total pages used by this index
+            if (index_array) {
+                // Atomically update allocCount to the maximum of current and required
+                u64 current_index_alloc = index_array->allocCount.load(std::memory_order_acquire);
+                while (current_index_alloc < total_local_pages) {
+                    if (index_array->allocCount.compare_exchange_weak(current_index_alloc, total_local_pages,
+                            std::memory_order_release, std::memory_order_acquire)) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    PID new_node_pid = getNodePID(new_node_id);
 
     // --- 1. Allocate space and initialize data for the new node on its page ---
     {
@@ -1235,32 +1271,21 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::computeDistancesToCandi
     const float* query, const std::vector<uint64_t>& candidate_ids, size_t k) {
     
     // Use a max-heap to keep track of top-k smallest distances
-    // The heap stores (distance, node_id) pairs
     std::priority_queue<std::pair<float, u32>> top_k_heap;
     
     for (uint64_t candidate_id : candidate_ids) {
         u32 node_id = static_cast<u32>(candidate_id);
         
-        // Skip invalid node IDs
         if (node_id >= max_elements_) {
             continue;
         }
         
-        // Get the page containing this node
         PID node_pid = getNodePID(node_id);
         
         try {
             GuardO<HNSWPage> page_guard(node_pid);
-            
-            // Get node accessor
             NodeAccessor node_acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
             const float* node_vector = node_acc.getVector();
-            
-            // Check if the node has valid data (level > 0 means it was inserted)
-            // Actually, we should check if the first few floats are non-zero
-            // A simpler check: just compute distance and trust the candidate list
-            
-            // Compute distance
             float dist = calculateDistance(query, node_vector);
             
             if (top_k_heap.size() < k) {
@@ -1270,21 +1295,547 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::computeDistancesToCandi
                 top_k_heap.emplace(dist, node_id);
             }
         } catch (...) {
-            // Skip nodes that can't be accessed
             continue;
         }
     }
     
-    // Convert heap to sorted vector (ascending order by distance)
     std::vector<std::pair<float, u32>> results;
     results.reserve(top_k_heap.size());
-    
     while (!top_k_heap.empty()) {
         results.push_back(top_k_heap.top());
         top_k_heap.pop();
     }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
+/**
+ * Filtered HNSW search: Traverse the HNSW graph normally but only accept 
+ * nodes that pass the filter predicate into the result set.
+ * 
+ * This is much faster than brute-force when selectivity is moderate (e.g. 1-50%)
+ * because it only computes distances to O(ef_search * expansion) nodes rather
+ * than all matching candidates.
+ * 
+ * The filter_fn returns true if the node_id passes the filter.
+ * ef_search is expanded proportionally to (1/selectivity) to compensate for
+ * filtered-out nodes.
+ */
+template <typename DistanceMetric>
+std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchKnnFiltered(
+    const float* query, size_t k, size_t ef_search_param,
+    const std::function<bool(u32)>& filter_fn) {
     
-    // Reverse to get ascending order
+    // --- 1. Get the global entry point ---
+    u32 enter_point_id;
+    u32 max_l;
+    for (;;) {
+        try {
+            GuardO<HNSWMetadataPage> meta_guard(metadata_pid);
+            enter_point_id = meta_guard->enter_point_node_id;
+            max_l = meta_guard->max_level.load(std::memory_order_acquire);
+            break;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+    }
+
+    if (enter_point_id == HNSWMetadataPage::invalid_node_id) {
+        return {};
+    }
+
+    IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
+
+    // --- 2. Calculate initial distance to entry point ---
+    float entry_dist;
+    for (;;) {
+        try {
+            GuardORelaxed<HNSWPage> initial_guard(getNodePID(enter_point_id), index_array);
+            NodeAccessor initial_acc(initial_guard.ptr, getNodeIndexInPage(enter_point_id), this);
+            entry_dist = DistanceMetric::compare(query, initial_acc.getVector(), Dim);
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+        break;
+    }
+
+    // --- 3. Greedily search upper layers (no filtering here) ---
+    std::pair<float, u32> entry_point_for_layer0 = {entry_dist, enter_point_id};
+    
+    if (max_l > 0) {
+        entry_point_for_layer0 = searchBaseLayer(query, enter_point_id, max_l, 1);
+    }
+    
+    // --- 4. Beam search on layer 0 with inline filtering ---
+    size_t ef_search = (ef_search_param == 0) ? std::max(static_cast<size_t>(efConstruction), k) : ef_search_param;
+    ef_search = std::max(ef_search, k);
+    
+    VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
+    vl_type* visited_array = visited_nodes->mass;
+    vl_type visited_array_tag = visited_nodes->curV;
+    
+    // top_candidates: all good candidates found (unfiltered, for graph traversal)
+    // filtered_results: only candidates that pass the filter (for final result)
+    std::priority_queue<std::pair<float, u32>> top_candidates;
+    std::priority_queue<std::pair<float, u32>> filtered_results; // max-heap, top-k filtered
+    std::priority_queue<std::pair<float, u32>, std::vector<std::pair<float, u32>>, 
+                        std::greater<std::pair<float, u32>>> candidate_queue;
+    
+    float entry_d = entry_point_for_layer0.first;
+    u32 entry_id = entry_point_for_layer0.second;
+    
+    top_candidates.push({entry_d, entry_id});
+    candidate_queue.push({entry_d, entry_id});
+    visited_array[entry_id] = visited_array_tag;
+    
+    // Check if entry point passes filter
+    if (filter_fn(entry_id)) {
+        filtered_results.push({entry_d, entry_id});
+    }
+    
+    while (!candidate_queue.empty()) {
+        auto current_pair = candidate_queue.top();
+        candidate_queue.pop();
+
+        // Stop if current candidate is worse than worst in top_candidates
+        if (top_candidates.size() >= ef_search && current_pair.first > top_candidates.top().first) {
+            break;
+        }
+        
+        u32 current_id = current_pair.second;
+        try {
+            GuardO<HNSWPage> current_page_guard(getNodePID(current_id), index_array);
+            NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_id), this);
+
+            if (current_acc.getLevel() < 0) continue;
+
+            auto neighbors = current_acc.getNeighbors(0, this);
+            
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                const u32 neighbor_id = neighbors[i];
+                
+                if (visited_array[neighbor_id] == visited_array_tag) {
+                    continue;
+                }
+                visited_array[neighbor_id] = visited_array_tag;
+                
+                float neighbor_dist;
+                try {
+                    PID neighbor_pid = getNodePID(neighbor_id);
+                    GuardORelaxed<HNSWPage> neighbor_page_guard(neighbor_pid, index_array);
+                    NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
+                    neighbor_dist = DistanceMetric::compare(query, neighbor_acc.getVector(), Dim);
+                } catch (const OLCRestartException&) {
+                    i--; // Retry
+                    continue;
+                }
+
+                // Always add to graph traversal structures (unfiltered)
+                if (top_candidates.size() < ef_search || neighbor_dist < top_candidates.top().first) {
+                    candidate_queue.push({neighbor_dist, neighbor_id});
+                    top_candidates.push({neighbor_dist, neighbor_id});
+                    if (top_candidates.size() > ef_search) {
+                        top_candidates.pop();
+                    }
+                }
+                
+                // Add to filtered results only if passes filter
+                if (filter_fn(neighbor_id)) {
+                    if (filtered_results.size() < k) {
+                        filtered_results.push({neighbor_dist, neighbor_id});
+                    } else if (neighbor_dist < filtered_results.top().first) {
+                        filtered_results.pop();
+                        filtered_results.push({neighbor_dist, neighbor_id});
+                    }
+                }
+            }
+        } catch (const OLCRestartException&) {
+            candidate_queue.push(current_pair);
+            continue;
+        }
+    }
+
+    visited_list_pool_->releaseVisitedList(visited_nodes);
+
+    // Extract filtered results sorted by distance ascending
+    std::vector<std::pair<float, u32>> results;
+    results.reserve(filtered_results.size());
+    while (!filtered_results.empty()) {
+        results.push_back(filtered_results.top());
+        filtered_results.pop();
+    }
+    std::reverse(results.begin(), results.end());
+    
+    return results;
+}
+
+/**
+ * ACORN-inspired filtered HNSW search with:
+ * 1. 2-hop neighbor expansion to traverse predicate subgraph
+ * 2. Multiple random entry points from matching set
+ * 3. Dynamic ef_search scaling based on selectivity
+ * 
+ * Based on the ACORN paper: "ACORN: Performant and Predicate-Agnostic Search Over 
+ * Vector Embeddings and Structured Data" (Patel et al., SIGMOD 2024)
+ */
+template <typename DistanceMetric>
+std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchKnnFilteredACORN(
+    const float* query, size_t k, size_t ef_search_param,
+    const std::function<bool(u32)>& filter_fn,
+    const std::vector<u32>& matching_ids,
+    float selectivity) {
+    
+    if (matching_ids.empty()) {
+        return {};
+    }
+    
+    // --- 1. Get entry point from metadata ---
+    u32 enter_point_id;
+    u32 max_l;
+    u32 node_count;
+    for (;;) {
+        try {
+            GuardO<HNSWMetadataPage> meta_guard(metadata_pid);
+            enter_point_id = meta_guard->enter_point_node_id;
+            max_l = meta_guard->max_level.load(std::memory_order_acquire);
+            node_count = meta_guard->node_count.load();
+            break;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+    }
+
+    if (enter_point_id == HNSWMetadataPage::invalid_node_id || node_count == 0) {
+        return {};
+    }
+
+    IndexTranslationArray* index_array = bm.getIndexArray(index_id_);
+
+    // --- 2. Dynamic ef_search scaling based on selectivity ---
+    // Lower selectivity needs larger ef_search to maintain recall
+    // ACORN uses γ = 1/selectivity as expansion factor
+    size_t base_ef = (ef_search_param == 0) ? std::max(static_cast<size_t>(efConstruction), k) : ef_search_param;
+    
+    // Scale ef_search inversely with selectivity, capped to avoid excessive computation
+    // For 10% selectivity: gamma=10, sqrt(10)≈3.16, so ef_search ≈ base_ef * 3.16
+    // We use a more aggressive scaling to ensure good recall at medium selectivity
+    float gamma = std::min(100.0f, 1.0f / std::max(0.001f, selectivity));
+    // Use linear scaling for medium selectivity (>5%) for better recall
+    size_t ef_search;
+    if (selectivity >= 0.05f) {
+        // Medium selectivity: more aggressive scaling
+        ef_search = std::min(static_cast<size_t>(base_ef * gamma), static_cast<size_t>(5000));
+    } else {
+        // Low selectivity: sqrt scaling to avoid excessive computation  
+        ef_search = std::min(static_cast<size_t>(base_ef * std::sqrt(gamma)), static_cast<size_t>(3000));
+    }
+    ef_search = std::max(ef_search, k * 4);
+    
+    VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
+    vl_type* visited_array = visited_nodes->mass;
+    vl_type visited_array_tag = visited_nodes->curV;
+    
+    // Results tracking
+    std::priority_queue<std::pair<float, u32>> top_candidates;  // For graph traversal
+    std::priority_queue<std::pair<float, u32>> filtered_results; // Final filtered results (max-heap)
+    std::priority_queue<std::pair<float, u32>, std::vector<std::pair<float, u32>>, 
+                        std::greater<std::pair<float, u32>>> candidate_queue;  // Min-heap for BFS
+    
+    // --- 3. Initialize with multiple entry points ---
+    // ACORN seeds with random entry points from the matching set
+    // This helps when the standard HNSW entry point is far from the predicate subgraph
+    
+    // First, find entry point via standard HNSW traversal of upper layers
+    float entry_dist;
+    for (;;) {
+        try {
+            GuardORelaxed<HNSWPage> initial_guard(getNodePID(enter_point_id), index_array);
+            NodeAccessor initial_acc(initial_guard.ptr, getNodeIndexInPage(enter_point_id), this);
+            entry_dist = DistanceMetric::compare(query, initial_acc.getVector(), Dim);
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+        break;
+    }
+    
+    // Navigate through upper layers to find better entry point
+    std::pair<float, u32> entry_point_for_layer0 = {entry_dist, enter_point_id};
+    if (max_l > 0) {
+        entry_point_for_layer0 = searchBaseLayer(query, enter_point_id, max_l, 1);
+    }
+    
+    // Get visited list size for bounds checking - do this EARLY before any visited_array access
+    u32 visited_array_size = visited_nodes->numelements;
+    
+    // Add HNSW entry point (with bounds check)
+    if (entry_point_for_layer0.second < visited_array_size) {
+        candidate_queue.push(entry_point_for_layer0);
+        top_candidates.push(entry_point_for_layer0);
+        visited_array[entry_point_for_layer0.second] = visited_array_tag;
+        
+        if (filter_fn(entry_point_for_layer0.second)) {
+            filtered_results.push(entry_point_for_layer0);
+        }
+    } else {
+        CALIBY_LOG_ERROR("HNSW", "ACORN entry_point out of bounds: id=", entry_point_for_layer0.second,
+                       " visited_array_size=", visited_array_size);
+    }
+    
+    // Add random entry points from matching set (ACORN-style seeding)
+    // Sample more entry points for better coverage - especially important for medium selectivity
+    // For 10% selectivity with 100k docs, we have ~10k matching docs
+    // sqrt(10000) ≈ 100, which is a good number of seeds
+    size_t num_random_seeds = std::min(
+        static_cast<size_t>(std::sqrt(matching_ids.size()) * 2 + 10),
+        std::min(matching_ids.size(), static_cast<size_t>(200))
+    );
+    
+    // Use deterministic sampling based on query for reproducibility
+    std::hash<float> hasher;
+    size_t seed = hasher(query[0]) ^ (hasher(query[1]) << 1);
+    std::mt19937 rng(seed);
+    
+    std::vector<size_t> sample_indices(matching_ids.size());
+    std::iota(sample_indices.begin(), sample_indices.end(), 0);
+    
+    // Debug: Check first few elements of matching_ids for ALL calls
+    // static int call_count = 0;
+    // call_count++;
+    // if (matching_ids.size() > 5) {
+    //     CALIBY_LOG_WARN("HNSW", "ACORN matching_ids call #", call_count, ": size=", matching_ids.size(),
+    //                    " first 5 elements: [0]=", matching_ids[0], " [1]=", matching_ids[1], 
+    //                    " [2]=", matching_ids[2], " [3]=", matching_ids[3], " [4]=", matching_ids[4],
+    //                    " data ptr=", reinterpret_cast<uintptr_t>(matching_ids.data()));
+    // }
+    
+    for (size_t i = 0; i < num_random_seeds && i < sample_indices.size(); ++i) {
+        std::uniform_int_distribution<size_t> dist(i, sample_indices.size() - 1);
+        std::swap(sample_indices[i], sample_indices[dist(rng)]);
+        
+        size_t idx = sample_indices[i];
+        if (idx >= matching_ids.size()) {
+            CALIBY_LOG_ERROR("HNSW", "ACORN sample_indices[", i, "]=", idx, 
+                           " >= matching_ids.size()=", matching_ids.size());
+            continue;
+        }
+        
+        // // Debug: On call #18, verify early elements are still valid
+        // if (call_count == 18 && i == 3) {
+        //     // Check multiple known-good elements
+        //     CALIBY_LOG_WARN("HNSW", "ACORN i=3 check: [0]=", matching_ids[0], " [1]=", matching_ids[1],
+        //                    " [2]=", matching_ids[2], " [1000]=", (matching_ids.size() > 1000 ? matching_ids[1000] : 0),
+        //                    " [5000]=", (matching_ids.size() > 5000 ? matching_ids[5000] : 0),
+        //                    " [10000]=", (matching_ids.size() > 10000 ? matching_ids[10000] : 0),
+        //                    " [15000]=", (matching_ids.size() > 15000 ? matching_ids[15000] : 0));
+        // }
+        
+        u32 seed_id = matching_ids[idx];
+        
+        // Bounds check for seed_id
+        if (seed_id >= visited_array_size) {
+            CALIBY_LOG_ERROR("HNSW", "ACORN seed_id out of bounds: seed_id=", seed_id, 
+                           " visited_array_size=", visited_array_size,
+                           " max_elements=", this->max_elements_,
+                           " matching_ids.size=", matching_ids.size(),
+                           " idx=", idx,
+                           " matching_ids.data()[", idx, "]=", matching_ids.data()[idx]);
+            continue;  // Skip invalid seed instead of crashing
+        }
+        
+        if (visited_array[seed_id] == visited_array_tag) continue;
+        
+        float seed_dist;
+        try {
+            GuardORelaxed<HNSWPage> seed_guard(getNodePID(seed_id), index_array);
+            NodeAccessor seed_acc(seed_guard.ptr, getNodeIndexInPage(seed_id), this);
+            seed_dist = DistanceMetric::compare(query, seed_acc.getVector(), Dim);
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+        
+        visited_array[seed_id] = visited_array_tag;
+        candidate_queue.push({seed_dist, seed_id});
+        top_candidates.push({seed_dist, seed_id});
+        
+        if (filtered_results.size() < k) {
+            filtered_results.push({seed_dist, seed_id});
+        } else if (seed_dist < filtered_results.top().first) {
+            filtered_results.pop();
+            filtered_results.push({seed_dist, seed_id});
+        }
+    }
+    
+    // --- 4. ACORN-style beam search with 2-hop neighbor expansion ---
+    while (!candidate_queue.empty()) {
+        auto current_pair = candidate_queue.top();
+        candidate_queue.pop();
+
+        // Early termination: if current candidate is worse than worst in ef_search set
+        if (top_candidates.size() >= ef_search && current_pair.first > top_candidates.top().first) {
+            break;
+        }
+        
+        u32 current_id = current_pair.second;
+        bool current_passes_filter = filter_fn(current_id);
+        
+        try {
+            GuardO<HNSWPage> current_page_guard(getNodePID(current_id), index_array);
+            NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_id), this);
+
+            if (current_acc.getLevel() < 0) continue;
+
+            auto neighbors = current_acc.getNeighbors(0, this);
+            
+            // Collect neighbor IDs for 2-hop expansion
+            std::vector<u32> two_hop_candidates;
+            
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                const u32 neighbor_id = neighbors[i];
+                
+                // Bounds check for neighbor_id
+                if (neighbor_id >= visited_array_size) {
+                    CALIBY_LOG_ERROR("HNSW", "ACORN neighbor_id out of bounds: neighbor_id=", neighbor_id, 
+                                   " visited_array_size=", visited_array_size,
+                                   " current_node=", current_pair.second);
+                    continue;  // Skip invalid neighbor instead of crashing
+                }
+                
+                if (visited_array[neighbor_id] == visited_array_tag) {
+                    // Already visited - but may need for 2-hop
+                    // If current doesn't pass filter, collect for 2-hop
+                    if (!current_passes_filter) {
+                        two_hop_candidates.push_back(neighbor_id);
+                    }
+                    continue;
+                }
+                visited_array[neighbor_id] = visited_array_tag;
+                
+                float neighbor_dist;
+                try {
+                    PID neighbor_pid = getNodePID(neighbor_id);
+                    GuardORelaxed<HNSWPage> neighbor_page_guard(neighbor_pid, index_array);
+                    NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
+                    neighbor_dist = DistanceMetric::compare(query, neighbor_acc.getVector(), Dim);
+                } catch (const OLCRestartException&) {
+                    i--;
+                    continue;
+                }
+
+                // Add to graph traversal structures
+                if (top_candidates.size() < ef_search || neighbor_dist < top_candidates.top().first) {
+                    candidate_queue.push({neighbor_dist, neighbor_id});
+                    top_candidates.push({neighbor_dist, neighbor_id});
+                    if (top_candidates.size() > ef_search) {
+                        top_candidates.pop();
+                    }
+                }
+                
+                // Add to filtered results if passes filter
+                if (filter_fn(neighbor_id)) {
+                    if (filtered_results.size() < k) {
+                        filtered_results.push({neighbor_dist, neighbor_id});
+                    } else if (neighbor_dist < filtered_results.top().first) {
+                        filtered_results.pop();
+                        filtered_results.push({neighbor_dist, neighbor_id});
+                    }
+                } else {
+                    // Doesn't pass filter - candidate for 2-hop expansion
+                    two_hop_candidates.push_back(neighbor_id);
+                }
+            }
+            
+            // --- 2-hop neighbor expansion (ACORN-1 style) ---
+            // When a node doesn't pass the filter, explore its neighbors
+            // This helps find paths through the predicate subgraph
+            // Enable for selectivity <= 20% (covers the 10% benchmark case)
+            if (selectivity <= 0.2f && !two_hop_candidates.empty()) {
+                // Limit 2-hop expansion to avoid excessive computation
+                size_t max_two_hop = std::min(two_hop_candidates.size(), static_cast<size_t>(M));
+                
+                for (size_t t = 0; t < max_two_hop; ++t) {
+                    u32 two_hop_node = two_hop_candidates[t];
+                    
+                    try {
+                        GuardO<HNSWPage> two_hop_guard(getNodePID(two_hop_node), index_array);
+                        NodeAccessor two_hop_acc(two_hop_guard.ptr, getNodeIndexInPage(two_hop_node), this);
+                        
+                        if (two_hop_acc.getLevel() < 0) continue;
+                        
+                        auto two_hop_neighbors = two_hop_acc.getNeighbors(0, this);
+                        
+                        for (size_t j = 0; j < two_hop_neighbors.size(); ++j) {
+                            u32 th_neighbor_id = two_hop_neighbors[j];
+                            
+                            // Bounds check for 2-hop neighbor
+                            if (th_neighbor_id >= visited_array_size) {
+                                CALIBY_LOG_ERROR("HNSW", "ACORN 2-hop neighbor out of bounds: id=", th_neighbor_id, 
+                                               " visited_array_size=", visited_array_size);
+                                continue;
+                            }
+                            
+                            if (visited_array[th_neighbor_id] == visited_array_tag) continue;
+                            
+                            // OPTIMIZATION: Mark as visited BEFORE filter check to avoid
+                            // re-checking the same non-matching nodes from different 2-hop paths
+                            visited_array[th_neighbor_id] = visited_array_tag;
+                            
+                            // Only expand to nodes that pass filter (predicate subgraph traversal)
+                            if (!filter_fn(th_neighbor_id)) continue;
+                            
+                            float th_dist;
+                            try {
+                                PID th_pid = getNodePID(th_neighbor_id);
+                                GuardORelaxed<HNSWPage> th_guard(th_pid, index_array);
+                                NodeAccessor th_acc(th_guard.ptr, getNodeIndexInPage(th_neighbor_id), this);
+                                th_dist = DistanceMetric::compare(query, th_acc.getVector(), Dim);
+                            } catch (const OLCRestartException&) {
+                                j--;
+                                continue;
+                            }
+                            
+                            // Add to traversal structures
+                            if (top_candidates.size() < ef_search || th_dist < top_candidates.top().first) {
+                                candidate_queue.push({th_dist, th_neighbor_id});
+                                top_candidates.push({th_dist, th_neighbor_id});
+                                if (top_candidates.size() > ef_search) {
+                                    top_candidates.pop();
+                                }
+                            }
+                            
+                            // Add to filtered results
+                            if (filtered_results.size() < k) {
+                                filtered_results.push({th_dist, th_neighbor_id});
+                            } else if (th_dist < filtered_results.top().first) {
+                                filtered_results.pop();
+                                filtered_results.push({th_dist, th_neighbor_id});
+                            }
+                        }
+                    } catch (const OLCRestartException&) {
+                        continue;
+                    }
+                }
+            }
+            
+        } catch (const OLCRestartException&) {
+            candidate_queue.push(current_pair);
+            continue;
+        }
+    }
+
+    visited_list_pool_->releaseVisitedList(visited_nodes);
+
+    // Extract filtered results sorted by distance ascending
+    std::vector<std::pair<float, u32>> results;
+    results.reserve(filtered_results.size());
+    while (!filtered_results.empty()) {
+        results.push_back(filtered_results.top());
+        filtered_results.pop();
+    }
+    // print if filtered_results.size() < k for debugging
+    if (results.size() < k) {
+        std::cerr << "[DEBUG searchKnnFilteredACORN] Warning: only " << results.size() 
+                  << " results found, fewer than requested k=" << k << std::endl;
+    }
     std::reverse(results.begin(), results.end());
     
     return results;

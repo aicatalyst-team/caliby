@@ -267,6 +267,23 @@ class HNSW {
     std::vector<std::pair<float, u32>> computeDistancesToCandidates(
         const float* query, const std::vector<uint64_t>& candidate_ids, size_t k);
 
+    // Filtered HNSW search: traverse graph normally but only accept nodes
+    // that pass the filter predicate into the result set.
+    std::vector<std::pair<float, u32>> searchKnnFiltered(
+        const float* query, size_t k, size_t ef_search_param,
+        const std::function<bool(u32)>& filter_fn);
+    
+    // ACORN-inspired filtered search with 2-hop neighbor expansion and multiple entry points
+    // This method provides higher recall for filtered searches by:
+    // 1. Using 2-hop neighbor expansion to find paths through non-matching nodes
+    // 2. Seeding search with multiple random entry points from the matching set
+    // 3. Dynamically scaling ef_search based on estimated selectivity
+    std::vector<std::pair<float, u32>> searchKnnFilteredACORN(
+        const float* query, size_t k, size_t ef_search_param,
+        const std::function<bool(u32)>& filter_fn,
+        const std::vector<u32>& matching_ids,  // Pre-filtered candidate IDs
+        float selectivity = 0.1f);  // Estimated selectivity (0-1)
+
     HNSW(const HNSW&) = delete;
     HNSW& operator=(const HNSW&) = delete;
     HNSW(HNSW&&) = delete;

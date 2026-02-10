@@ -30,6 +30,7 @@
 #include "calico.hpp"
 #include "catalog.hpp"
 #include "btree_index.hpp"
+#include "array_index.hpp"
 
 // Forward declarations
 class BufferManager;
@@ -210,6 +211,7 @@ enum class FilterOp : uint8_t {
     CONTAINS = 8, // array contains
     AND = 9,      // logical and
     OR = 10,      // logical or
+    NOT = 11,     // logical not
 };
 
 /**
@@ -356,6 +358,18 @@ public:
     // Search for k nearest neighbors
     virtual std::vector<std::pair<float, uint32_t>> searchKnn(
         const float* query, size_t k, size_t ef_search = 100) = 0;
+
+    // Search for k nearest neighbors with a filter predicate
+    virtual std::vector<std::pair<float, uint32_t>> searchKnnFiltered(
+        const float* query, size_t k, size_t ef_search,
+        const std::function<bool(uint32_t)>& filter_fn) = 0;
+    
+    // ACORN-inspired filtered search with 2-hop expansion and multiple entry points
+    virtual std::vector<std::pair<float, uint32_t>> searchKnnFilteredACORN(
+        const float* query, size_t k, size_t ef_search,
+        const std::function<bool(uint32_t)>& filter_fn,
+        const std::vector<uint32_t>& matching_ids,
+        float selectivity) = 0;
     
     // Compute distances from query to specific candidate IDs (for pre-filtering)
     // Returns vector of (distance, node_id) pairs sorted by distance
@@ -667,6 +681,15 @@ public:
     }
     
     /**
+     * Create an inverted index on an array field for fast $contains queries.
+     * This accelerates filters like: {"tags": {"$contains": "python"}}
+     * 
+     * @param name Index name
+     * @param field_name Name of the array field to index (must be STRING_ARRAY or INT_ARRAY)
+     */
+    void create_array_index(const std::string& name, const std::string& field_name);
+    
+    /**
      * List all indices attached to this collection.
      */
     std::vector<CollectionIndexInfo> list_indices() const;
@@ -780,6 +803,10 @@ private:
     // Used for fast filter evaluation on indexed fields
     std::unordered_map<std::string, std::unique_ptr<BTreeMetadataIndex>> btree_indices_;
     
+    // Array inverted indices (keyed by field name)
+    // Used for fast $contains filter evaluation on array fields
+    std::unordered_map<std::string, std::unique_ptr<ArrayIndex>> array_indices_;
+    
     // Internal methods
     void load_metadata();
     void save_metadata();
@@ -790,7 +817,7 @@ private:
     
     // Document storage methods
     void write_document(const Document& doc);
-    Document read_document(uint64_t doc_id);
+    Document read_document(uint64_t doc_id, bool parse_metadata = true);
     void delete_document_internal(uint64_t doc_id);
     
     // ID index methods (B-tree)
@@ -807,11 +834,20 @@ private:
     std::vector<uint64_t> evaluate_filter(const FilterCondition& filter);
     float estimate_selectivity(const FilterCondition& filter);
     
+    // Estimate cardinality (number of matching docs) using histograms
+    uint64_t estimate_cardinality(const FilterCondition& filter) const;
+    
     // Find btree index for a field (returns nullptr if none)
     BTreeMetadataIndex* find_btree_index_for_field(const std::string& field_name) const;
     
+    // Find array index for a field (returns nullptr if none)
+    ArrayIndex* find_array_index_for_field(const std::string& field_name) const;
+    
     // Index btree indices when adding/updating documents
     void update_btree_indices_for_document(uint64_t doc_id, const nlohmann::json& metadata, bool is_delete = false);
+    
+    // Index array indices when adding/updating documents
+    void update_array_indices_for_document(uint64_t doc_id, const nlohmann::json& metadata, bool is_delete = false);
 };
 
 } // namespace caliby

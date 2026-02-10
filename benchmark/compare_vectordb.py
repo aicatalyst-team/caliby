@@ -35,6 +35,10 @@ import argparse
 import json
 import gc
 
+# Force unbuffered output for real-time logging
+import functools
+print = functools.partial(print, flush=True)
+
 # Add parent directory to path to import local caliby build
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -44,6 +48,7 @@ LIBS_AVAILABLE = {}
 try:
     import caliby
     caliby.set_buffer_config(size_gb=16)
+    caliby.set_log_level("WARN")  # Hide INFO messages
     LIBS_AVAILABLE['caliby'] = True
 except ImportError as e:
     print(f"Warning: caliby not available: {e}")
@@ -1024,7 +1029,12 @@ def benchmark_caliby_filtered(base_vectors, query_vectors, groundtruth, params):
         meta_idx_start = time.time()
         for field in metadata_fields:
             try:
-                collection.create_metadata_index(f"{field}_idx", [field])
+                if field in array_fields:
+                    # Use array index for array fields (enables $contains queries)
+                    collection.create_array_index(f"{field}_idx", field)
+                    print(f"  ✓ Created array index for '{field}'")
+                else:
+                    collection.create_metadata_index(f"{field}_idx", [field])
             except Exception as e:
                 print(f"  Warning: Could not create index for {field}: {e}")
         meta_idx_time = time.time() - meta_idx_start
@@ -1105,7 +1115,7 @@ def benchmark_caliby_filtered(base_vectors, query_vectors, groundtruth, params):
         search_start = time.time()
         for i in range(num_queries):
             start = time.perf_counter()
-            results = collection.search_vector(query_vectors[i].tolist(), "vec_idx", k=k, ef_search=100)
+            results = collection.search_vector(query_vectors[i].tolist(), "vec_idx", k=k, ef_search=50)
             elapsed = (time.perf_counter() - start) * 1000
             
             search_latencies.append(elapsed)
@@ -1161,33 +1171,76 @@ def benchmark_caliby_filtered(base_vectors, query_vectors, groundtruth, params):
             collection.search_vector(query_vectors[i].tolist(), "vec_idx", k=k, filter=filter_json, ef_search=100)
         
         filtered_start = time.time()
-        skipped_contains_count = 0
+        slow_query_threshold_ms = 100  # Log queries slower than 100ms
+        very_slow_threshold_ms = 1000  # Very slow queries
+        
+        # Track latencies by filter type for analysis
+        latencies_by_filter_type = {'labels': [], 'submitter': [], 'update_date_ts': [], 'combined': [], 'other': []}
+        
+        print(f"\n  === Starting filtered search benchmark ({len(test_queries)} queries) ===")
+        
         for i, tq in enumerate(test_queries):
             query_vec = tq['query']
+            # Ensure query_vec is a Python list (not numpy array)
+            if isinstance(query_vec, np.ndarray):
+                query_vec = query_vec.tolist()
             conditions = tq.get('conditions', {})
             expected_ids = tq.get('closest_ids', [])[:k]
             
             # Count filter types
+            filter_fields_for_this_query = []
             if 'and' in conditions:
                 for cond in conditions['and']:
                     for field in cond.keys():
+                        filter_fields_for_this_query.append(field)
                         if field in filter_type_counts:
                             filter_type_counts[field] += 1
                         else:
                             filter_type_counts['other'] += 1
             
+            # Determine filter category
+            if len(filter_fields_for_this_query) > 1:
+                filter_category = 'combined'
+            elif len(filter_fields_for_this_query) == 1:
+                field = filter_fields_for_this_query[0]
+                filter_category = field if field in latencies_by_filter_type else 'other'
+            else:
+                filter_category = 'other'
+            
             # Convert conditions to Caliby format (pass array_fields to use $contains for arrays)
             caliby_filter = convert_qdrant_conditions_to_caliby(conditions, array_fields)
-            
-            # Skip queries that use $contains (array fields) for now - btree doesn't support them
             filter_json = json.dumps(caliby_filter) if caliby_filter else ""
-            if '$contains' in filter_json:
-                skipped_contains_count += 1
-                continue
+            
+            # Print BEFORE running query so we know which one is stuck
+            #print(f"  [Query {i}] STARTING | type={filter_category} | filter={filter_json[:200]}...")
             
             start = time.perf_counter()
             results = collection.search_vector(query_vec, "vec_idx", k=k, filter=filter_json, ef_search=100)
             elapsed = (time.perf_counter() - start) * 1000
+            
+            # Print AFTER query completes with latency
+            #print(f"  [Query {i}] DONE | {elapsed:.2f}ms | results={len(results)}")
+            
+            # Debug: check recall for first 5 labels queries
+            if filter_category == 'labels' and len([x for x in latencies_by_filter_type['labels']]) < 5:
+                result_ids = [r.doc_id for r in results]
+                gt_ids = expected_ids[:k]
+                overlap = set(result_ids) & set(gt_ids)
+                print(f"    [DEBUG labels] Results: {result_ids[:5]}...")
+                print(f"    [DEBUG labels] GroundTruth: {gt_ids[:5]}...")
+                print(f"    [DEBUG labels] Overlap: {len(overlap)}/{len(gt_ids)} = {len(overlap)/max(len(gt_ids),1):.2f}")
+            
+            # Track latency by filter type
+            latencies_by_filter_type[filter_category].append(elapsed)
+            
+            # Log slow queries with extra details
+            if elapsed > very_slow_threshold_ms:
+                print(f"  [VERY SLOW #{i}] {elapsed:.1f}ms | type={filter_category} | fields={filter_fields_for_this_query}")
+                print(f"    Full Filter: {filter_json}")
+                print(f"    Results: {len(results)}")
+            elif elapsed > slow_query_threshold_ms:
+                print(f"  [SLOW #{i}] {elapsed:.1f}ms | type={filter_category} | fields={filter_fields_for_this_query}")
+                print(f"    Filter: {filter_json[:500]}")
             
             if len(results) == 0:
                 empty_result_count += 1
@@ -1196,10 +1249,7 @@ def benchmark_caliby_filtered(base_vectors, query_vectors, groundtruth, params):
             filtered_results.append([r.doc_id for r in results])
             filtered_groundtruths.append(expected_ids)
         
-        if skipped_contains_count > 0:
-            print(f"  (Skipped {skipped_contains_count} queries with $contains filters)")
-        
-        num_filtered_queries = len(filtered_latencies)  # Update count after skipping
+        num_filtered_queries = len(filtered_latencies)
         filtered_total_time = time.time() - filtered_start
         filtered_qps = num_filtered_queries / filtered_total_time if num_filtered_queries > 0 else 0
         
@@ -1229,11 +1279,19 @@ def benchmark_caliby_filtered(base_vectors, query_vectors, groundtruth, params):
         
         filtered_recall = filtered_recall_sum / len(filtered_results) if filtered_results else 0
         
+        print(f"\n  === Filtered Search Results ===")
         print(f"  ✓ Filtered queries: {num_filtered_queries}")
         print(f"  ✓ Filter type distribution: {filter_type_counts}")
         print(f"  ✓ Empty result count: {empty_result_count} ({100*empty_result_count/num_filtered_queries:.1f}%)")
         print(f"  ✓ QPS: {filtered_qps:.1f} queries/sec")
         print(f"  ✓ Latency P50: {filtered_p50:.2f} ms")
+        
+        # Print detailed latency breakdown by filter type
+        print(f"\n  === Latency Breakdown by Filter Type ===")
+        for filter_type, lats in latencies_by_filter_type.items():
+            if lats:
+                lats_arr = np.array(lats)
+                print(f"    {filter_type:20s}: n={len(lats):4d} | P50={np.percentile(lats_arr, 50):7.1f}ms | P95={np.percentile(lats_arr, 95):7.1f}ms | max={np.max(lats_arr):7.1f}ms")
         print(f"  ✓ Latency P95: {filtered_p95:.2f} ms")
         print(f"  ✓ Filtered Recall@10: {filtered_recall:.4f}")
         
@@ -2287,6 +2345,8 @@ def main():
                         help='HNSW ef_construction parameter (Caliby)')
     parser.add_argument('--insert-batch-size', type=int, default=10000,
                         help='Batch size for insertions')
+    parser.add_argument('--num-queries', type=int, default=None,
+                        help='Limit number of queries for filtered benchmark (default: all)')
     
     args = parser.parse_args()
     
@@ -2324,6 +2384,14 @@ def main():
         dataset_name = "Deep10M"
     elif args.dataset == 'arxiv':
         base_vectors, test_queries, payloads = load_qdrant_filtered_dataset(args.data_dir, 'arxiv')
+        # Limit vectors and queries first to speed up ground truth computation
+        if args.num_vectors is not None:
+            print(f"  Limiting to {args.num_vectors} vectors")
+            base_vectors = base_vectors[:args.num_vectors]
+            payloads = payloads[:args.num_vectors]
+        if args.num_queries is not None:
+            test_queries = test_queries[:args.num_queries]
+            print(f"  Limiting to {args.num_queries} queries")
         query_vectors = np.array([q['query'] for q in test_queries], dtype=np.float32)
         # IMPORTANT: closest_ids in test queries are computed WITH filters applied!
         # We need to compute fresh unfiltered ground truth for unfiltered search benchmarks
@@ -2333,6 +2401,14 @@ def main():
         dataset_name = "ArXiv"
     elif args.dataset == 'hnm':
         base_vectors, test_queries, payloads = load_qdrant_filtered_dataset(args.data_dir, 'hnm')
+        # Limit vectors and queries first to speed up ground truth computation
+        if args.num_vectors is not None:
+            print(f"  Limiting to {args.num_vectors} vectors")
+            base_vectors = base_vectors[:args.num_vectors]
+            payloads = payloads[:args.num_vectors]
+        if args.num_queries is not None:
+            test_queries = test_queries[:args.num_queries]
+            print(f"  Limiting to {args.num_queries} queries")
         query_vectors = np.array([q['query'] for q in test_queries], dtype=np.float32)
         # IMPORTANT: closest_ids in test queries are computed WITH filters applied!
         # We need to compute fresh unfiltered ground truth for unfiltered search benchmarks
@@ -2343,8 +2419,8 @@ def main():
         print(f"Error: Unknown dataset {args.dataset}")
         sys.exit(1)
     
-    # Limit vectors if requested
-    if args.num_vectors is not None:
+    # Limit vectors if requested (for sift1m and deep10m - arxiv/hnm already limited above)
+    if args.num_vectors is not None and args.dataset not in ['arxiv', 'hnm']:
         print(f"\nLimiting to {args.num_vectors} vectors for testing")
         base_vectors = base_vectors[:args.num_vectors]
         # IMPORTANT: Must recompute ground truth for the subset!
@@ -2397,6 +2473,7 @@ def main():
             results.append(result)
     elif args.chromadb_only:
         print("ChromaDB not available, skipping...")
+        
     
     # Run Qdrant benchmark (commented out)
     # if (run_all or args.qdrant_only) and LIBS_AVAILABLE.get('qdrant', False):

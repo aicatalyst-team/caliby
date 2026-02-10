@@ -107,7 +107,7 @@ using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 // --- Python Module Definition ---
 PYBIND11_MODULE(caliby, m) {
     m.doc() = "Python bindings for the Calico Index(B-Tree, HNSW)";
-    m.attr("__version__") = "0.1.0.dev20260203030535";
+    m.attr("__version__") = "0.1.0.dev20260210001438";
     
     // Register cleanup function to be called at module unload
     auto cleanup = []() {
@@ -1422,6 +1422,27 @@ Examples:
             self.create_metadata_index(name, config);
         }, py::arg("name"), py::arg("field"), py::arg("unique") = false,
         "Create a B-tree index on a metadata field. (Legacy API - use create_metadata_index instead)")
+        
+        // Array index for fast $contains queries
+        .def("create_array_index", &caliby::Collection::create_array_index,
+             py::arg("name"), py::arg("field"),
+R"doc(Create an inverted index on an array field for fast $contains queries.
+
+This accelerates filters like: {"tags": {"$contains": "python"}}
+
+Args:
+    name: Index name
+    field: Name of the array field to index (must be STRING_ARRAY or INT_ARRAY type)
+
+Example:
+    schema = caliby.Schema()
+    schema.add_field("tags", caliby.FieldType.STRING_ARRAY)
+    col = caliby.Collection("docs", schema)
+    col.create_array_index("tags_idx", "tags")
+    
+    # Now this filter is fast:
+    results = col.search_vector(query, "vec", 10, filter='{"tags": {"$contains": "python"}}')
+)doc")
         
         .def("list_indices", [](caliby::Collection& self) {
             py::list result;

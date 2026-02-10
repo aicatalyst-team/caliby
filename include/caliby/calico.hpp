@@ -936,7 +936,7 @@ struct GuardO {
     }
 
     GuardO(GuardO&& other) {
-        pid = other.pid;
+        pid = other.pid; 
         ptr = other.ptr;
         version = other.version;
         arr = other.arr;
@@ -987,10 +987,10 @@ struct GuardO {
     void initWithArray(IndexTranslationArray* arr) {
         assert(pid != moved);
         // Fallback to regular init if arr is null (for non-Array2Level modes)
-        // if (arr == nullptr) {
-        //     init();
-        //     return;
-        // }
+        if (arr == nullptr) {
+            init();
+            return;
+        }
         // Extract local page ID from the global PID
         u32 localPageId = static_cast<u32>(pid & TwoLevelPageStateArray::LOCAL_PAGE_MASK);
         PageState& ps = arr->get(localPageId);
@@ -1182,6 +1182,11 @@ struct GuardORelaxed {
 
     void initWithArray(IndexTranslationArray* arr) {
         assert(pid != moved);
+        // Fallback to regular init if arr is null (for non-Array2Level modes)
+        if (arr == nullptr) {
+            init();
+            return;
+        }
         // Extract local page ID from the global PID
         u32 localPageId = static_cast<u32>(pid & TwoLevelPageStateArray::LOCAL_PAGE_MASK);
         PageState& ps = arr->get(localPageId);
@@ -1670,6 +1675,15 @@ struct BTree {
    private:
     void trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, std::span<u8> key, unsigned payloadLen);
     void ensureSpace(BTreeNode* toSplit, std::span<u8> key, unsigned payloadLen);
+    
+    // Cached IndexTranslationArray for bypassing TLS lookups in hot paths
+    // This is lazily initialized on first use and cached for the lifetime of the BTree
+    mutable IndexTranslationArray* cachedIndexArray_ = nullptr;
+    
+    // Get the cached IndexTranslationArray (lazy initialization)
+    IndexTranslationArray* getIndexArray() const {
+        return cachedIndexArray_;
+    }
 
    public:
     unsigned slotId;

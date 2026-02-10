@@ -214,6 +214,311 @@ CompositeKey deserialize_composite_key(const uint8_t* data, size_t len) {
 }
 
 //=============================================================================
+// FieldHistogram Implementation
+//=============================================================================
+
+FieldHistogram::FieldHistogram(BTreeKeyType key_type, size_t num_buckets)
+    : key_type_(key_type)
+    , num_buckets_(num_buckets)
+    , bucket_counts_(num_buckets, 0)
+{
+}
+
+double FieldHistogram::key_to_double(const BTreeKey& key) const {
+    return std::visit([](auto&& v) -> double {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, int64_t>) {
+            return static_cast<double>(v);
+        } else if constexpr (std::is_same_v<T, double>) {
+            return v;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            return v ? 1.0 : 0.0;
+        } else {
+            // String - hash to double for bucket assignment
+            std::hash<std::string> hasher;
+            return static_cast<double>(hasher(v) % 1000000) / 1000000.0;
+        }
+    }, key);
+}
+
+size_t FieldHistogram::get_bucket_index(double val) const {
+    if (!bounds_initialized_ || max_val_ <= min_val_) {
+        return 0;
+    }
+    double normalized = (val - min_val_) / (max_val_ - min_val_);
+    normalized = std::max(0.0, std::min(1.0, normalized));
+    size_t idx = static_cast<size_t>(normalized * (num_buckets_ - 1));
+    return std::min(idx, num_buckets_ - 1);
+}
+
+double FieldHistogram::bucket_fraction(size_t bucket_idx, double range_min, double range_max) const {
+    if (!bounds_initialized_ || max_val_ <= min_val_) {
+        return 1.0;
+    }
+    
+    double bucket_width = (max_val_ - min_val_) / num_buckets_;
+    double bucket_min = min_val_ + bucket_idx * bucket_width;
+    double bucket_max = bucket_min + bucket_width;
+    
+    // Clamp range to bucket bounds
+    double overlap_min = std::max(range_min, bucket_min);
+    double overlap_max = std::min(range_max, bucket_max);
+    
+    if (overlap_max <= overlap_min) {
+        return 0.0;
+    }
+    
+    return (overlap_max - overlap_min) / bucket_width;
+}
+
+void FieldHistogram::add_value(const BTreeKey& key) {
+    total_count_++;
+    
+    if (key_type_ == BTreeKeyType::STRING) {
+        const std::string& str_val = std::get<std::string>(key);
+        auto it = string_freq_.find(str_val);
+        if (it != string_freq_.end()) {
+            it->second++;
+        } else if (string_freq_.size() < MAX_STRING_DISTINCT) {
+            string_freq_[str_val] = 1;
+            distinct_count_++;
+        } else {
+            other_count_++;
+        }
+        return;
+    }
+    
+    if (key_type_ == BTreeKeyType::BOOL) {
+        if (std::get<bool>(key)) {
+            true_count_++;
+        } else {
+            false_count_++;
+        }
+        distinct_count_ = (true_count_ > 0 ? 1 : 0) + (false_count_ > 0 ? 1 : 0);
+        return;
+    }
+    
+    // Numeric types
+    double val = key_to_double(key);
+    
+    // Update bounds
+    if (!bounds_initialized_) {
+        min_val_ = val;
+        max_val_ = val;
+        bounds_initialized_ = true;
+        distinct_count_ = 1;
+        bucket_counts_[0] = 1;
+        return;
+    }
+    
+    bool bounds_changed = false;
+    if (val < min_val_) {
+        min_val_ = val;
+        bounds_changed = true;
+    }
+    if (val > max_val_) {
+        max_val_ = val;
+        bounds_changed = true;
+    }
+    
+    // If bounds changed significantly, we'd ideally rebuild the histogram
+    // For simplicity, just add to appropriate bucket
+    size_t bucket = get_bucket_index(val);
+    bucket_counts_[bucket]++;
+    
+    // Approximate distinct count using bucket occupancy
+    if (bounds_changed) {
+        distinct_count_++;
+    }
+}
+
+void FieldHistogram::remove_value(const BTreeKey& key) {
+    if (total_count_ == 0) return;
+    total_count_--;
+    
+    if (key_type_ == BTreeKeyType::STRING) {
+        const std::string& str_val = std::get<std::string>(key);
+        auto it = string_freq_.find(str_val);
+        if (it != string_freq_.end()) {
+            if (--it->second == 0) {
+                string_freq_.erase(it);
+                if (distinct_count_ > 0) distinct_count_--;
+            }
+        } else if (other_count_ > 0) {
+            other_count_--;
+        }
+        return;
+    }
+    
+    if (key_type_ == BTreeKeyType::BOOL) {
+        if (std::get<bool>(key)) {
+            if (true_count_ > 0) true_count_--;
+        } else {
+            if (false_count_ > 0) false_count_--;
+        }
+        distinct_count_ = (true_count_ > 0 ? 1 : 0) + (false_count_ > 0 ? 1 : 0);
+        return;
+    }
+    
+    // Numeric types - decrement appropriate bucket
+    double val = key_to_double(key);
+    size_t bucket = get_bucket_index(val);
+    if (bucket_counts_[bucket] > 0) {
+        bucket_counts_[bucket]--;
+    }
+}
+
+void FieldHistogram::rebuild(const std::vector<BTreeKey>& values) {
+    // Reset state
+    total_count_ = 0;
+    distinct_count_ = 0;
+    std::fill(bucket_counts_.begin(), bucket_counts_.end(), 0);
+    string_freq_.clear();
+    other_count_ = 0;
+    true_count_ = 0;
+    false_count_ = 0;
+    bounds_initialized_ = false;
+    min_val_ = std::numeric_limits<double>::max();
+    max_val_ = std::numeric_limits<double>::lowest();
+    
+    if (values.empty()) return;
+    
+    // For numeric types, first pass to find min/max
+    if (key_type_ == BTreeKeyType::INT || key_type_ == BTreeKeyType::FLOAT) {
+        for (const auto& key : values) {
+            double val = key_to_double(key);
+            if (val < min_val_) min_val_ = val;
+            if (val > max_val_) max_val_ = val;
+        }
+        bounds_initialized_ = true;
+    }
+    
+    // Second pass to populate histogram
+    for (const auto& key : values) {
+        add_value(key);
+    }
+}
+
+uint64_t FieldHistogram::estimate_eq(const BTreeKey& value) const {
+    if (total_count_ == 0) return 0;
+    
+    if (key_type_ == BTreeKeyType::STRING) {
+        const std::string& str_val = std::get<std::string>(value);
+        auto it = string_freq_.find(str_val);
+        if (it != string_freq_.end()) {
+            return it->second;
+        }
+        // Unknown string - estimate using uniform distribution over "other"
+        if (distinct_count_ > string_freq_.size()) {
+            uint64_t unknown_distinct = distinct_count_ - string_freq_.size();
+            return other_count_ / std::max(unknown_distinct, static_cast<uint64_t>(1));
+        }
+        return 0;
+    }
+    
+    if (key_type_ == BTreeKeyType::BOOL) {
+        return std::get<bool>(value) ? true_count_ : false_count_;
+    }
+    
+    // Numeric types - estimate using bucket and distinct count
+    if (!bounds_initialized_) return 0;
+    
+    double val = key_to_double(value);
+    if (val < min_val_ || val > max_val_) return 0;
+    
+    size_t bucket = get_bucket_index(val);
+    uint64_t bucket_count = bucket_counts_[bucket];
+    
+    // Estimate distinct values in bucket, then divide
+    // Assume uniform distribution of distinct values across buckets
+    uint64_t bucket_distinct = std::max(static_cast<uint64_t>(1), 
+                                        distinct_count_ / num_buckets_);
+    return bucket_count / std::max(bucket_distinct, static_cast<uint64_t>(1));
+}
+
+uint64_t FieldHistogram::estimate_range(
+    const std::optional<BTreeKey>& min_val,
+    const std::optional<BTreeKey>& max_val,
+    bool include_min,
+    bool include_max) const {
+    
+    if (total_count_ == 0) return 0;
+    
+    if (key_type_ == BTreeKeyType::STRING) {
+        // For strings, range queries are rare - use heuristic
+        // Estimate based on fraction of alphabet covered
+        if (!min_val.has_value() && !max_val.has_value()) {
+            return total_count_;
+        }
+        // Rough estimate: 30% of data
+        return total_count_ * 3 / 10;
+    }
+    
+    if (key_type_ == BTreeKeyType::BOOL) {
+        // Range on bool doesn't make much sense, but handle it
+        if (!min_val.has_value() && !max_val.has_value()) {
+            return total_count_;
+        }
+        // Just return total for bool ranges
+        return total_count_;
+    }
+    
+    // Numeric types
+    if (!bounds_initialized_) return 0;
+    
+    double range_min = min_val.has_value() ? key_to_double(*min_val) : min_val_;
+    double range_max = max_val.has_value() ? key_to_double(*max_val) : max_val_;
+    
+    // Clamp to data bounds
+    range_min = std::max(range_min, min_val_);
+    range_max = std::min(range_max, max_val_);
+    
+    if (range_max < range_min) return 0;
+    
+    // Sum bucket contributions
+    uint64_t estimate = 0;
+    for (size_t i = 0; i < num_buckets_; i++) {
+        double bucket_width = (max_val_ - min_val_) / num_buckets_;
+        double bucket_min = min_val_ + i * bucket_width;
+        double bucket_max = bucket_min + bucket_width;
+        
+        // Check if bucket overlaps with range
+        if (bucket_max < range_min || bucket_min > range_max) {
+            continue;
+        }
+        
+        // Compute fraction of bucket covered
+        double frac = bucket_fraction(i, range_min, range_max);
+        estimate += static_cast<uint64_t>(bucket_counts_[i] * frac);
+    }
+    
+    return estimate;
+}
+
+uint64_t FieldHistogram::estimate_in(const std::vector<BTreeKey>& values) const {
+    uint64_t estimate = 0;
+    for (const auto& val : values) {
+        estimate += estimate_eq(val);
+    }
+    // Cap at total count
+    return std::min(estimate, total_count_);
+}
+
+std::optional<double> FieldHistogram::min_value() const {
+    if (!bounds_initialized_ || key_type_ == BTreeKeyType::STRING) {
+        return std::nullopt;
+    }
+    return min_val_;
+}
+
+std::optional<double> FieldHistogram::max_value() const {
+    if (!bounds_initialized_ || key_type_ == BTreeKeyType::STRING) {
+        return std::nullopt;
+    }
+    return max_val_;
+}
+
+//=============================================================================
 // BTreeMetadataIndex Implementation
 //=============================================================================
 
@@ -224,6 +529,7 @@ BTreeMetadataIndex::BTreeMetadataIndex(const std::string& field_name,
     , key_type_(key_type)
     , unique_(unique)
     , btree_(std::make_unique<BTree>())
+    , histogram_(key_type)
 {
 }
 
@@ -264,6 +570,9 @@ void BTreeMetadataIndex::insert(const BTreeKey& key, uint64_t doc_id) {
         std::span<uint8_t>(payload.data(), payload.size())
     );
     
+    // Update histogram for cardinality estimation
+    histogram_.add_value(key);
+    
     entry_count_.fetch_add(1);
 }
 
@@ -273,6 +582,8 @@ void BTreeMetadataIndex::remove(const BTreeKey& key, uint64_t doc_id) {
     auto key_bytes = make_composite_key(key, doc_id);
     
     if (btree_->remove(std::span<uint8_t>(key_bytes.data(), key_bytes.size()))) {
+        // Update histogram
+        histogram_.remove_value(key);
         entry_count_.fetch_sub(1);
     }
 }
@@ -299,10 +610,10 @@ std::vector<uint64_t> BTreeMetadataIndex::lookup(const BTreeKey& key) const {
         );
         
         if (len > 0) {
-            uint64_t doc_id = 0;
-            for (int i = 0; i < 8; ++i) {
-                doc_id = (doc_id << 8) | payload[i];
-            }
+            // OPTIMIZED: Direct memory read + byte swap
+            uint64_t doc_id;
+            std::memcpy(&doc_id, payload, sizeof(uint64_t));
+            doc_id = __builtin_bswap64(doc_id);
             results.push_back(doc_id);
         }
     } else {
@@ -310,27 +621,43 @@ std::vector<uint64_t> BTreeMetadataIndex::lookup(const BTreeKey& key) const {
         // For non-unique, the key has doc_id appended, so we need range scan
         auto scan_key = key_bytes;
         
+        // Allocate buffer for full key (prefix + slot key)
+        // Max key size is bounded by page size
+        std::vector<uint8_t> full_key_buffer(4096);
+        
         const_cast<BTree*>(btree_.get())->scanAsc(
             std::span<uint8_t>(scan_key.data(), scan_key.size()),
             [&](BTreeNode& node, unsigned slot) -> bool {
-                // Check if key still matches prefix
-                auto node_key = std::span<uint8_t>(node.getKey(slot), node.slot[slot].keyLen);
+                // Reconstruct full key: prefix + slot key
+                // BTreeNode stores shared prefix separately from slot-specific key suffix
+                uint16_t prefix_len = node.prefixLen;
+                uint16_t slot_key_len = node.slot[slot].keyLen;
+                uint16_t full_key_len = prefix_len + slot_key_len;
                 
-                if (node_key.size() < key_bytes.size()) {
-                    return false;  // Stop scan
+                if (full_key_len > full_key_buffer.size()) {
+                    full_key_buffer.resize(full_key_len);
+                }
+                
+                // Copy prefix and slot key to get full key
+                std::memcpy(full_key_buffer.data(), node.getPrefix(), prefix_len);
+                std::memcpy(full_key_buffer.data() + prefix_len, node.getKey(slot), slot_key_len);
+                
+                // Check if full key matches our search key prefix
+                if (full_key_len < key_bytes.size()) {
+                    return false;  // Full key shorter than search prefix, stop
                 }
                 
                 // Compare prefix
-                if (std::memcmp(node_key.data(), key_bytes.data(), key_bytes.size()) != 0) {
+                if (std::memcmp(full_key_buffer.data(), key_bytes.data(), key_bytes.size()) != 0) {
                     return false;  // Prefix doesn't match, stop
                 }
                 
-                // Extract doc_id from composite key
-                if (node_key.size() >= key_bytes.size() + sizeof(uint64_t)) {
-                    uint64_t doc_id = 0;
-                    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-                        doc_id = (doc_id << 8) | node_key[key_bytes.size() + i];
-                    }
+                // Extract doc_id from composite key (appended after the search key)
+                if (full_key_len >= key_bytes.size() + sizeof(uint64_t)) {
+                    // OPTIMIZED: Direct memory read + byte swap
+                    uint64_t doc_id;
+                    std::memcpy(&doc_id, &full_key_buffer[key_bytes.size()], sizeof(uint64_t));
+                    doc_id = __builtin_bswap64(doc_id);
                     results.push_back(doc_id);
                 }
                 
@@ -352,42 +679,61 @@ BTreeRangeIterator BTreeMetadataIndex::range_scan(
     
     BTreeRangeIterator iter;
     
-    // Determine start key
+    // PRE-SERIALIZE keys ONCE before the scan loop (OPTIMIZATION)
     std::vector<uint8_t> start_key;
     if (min_key) {
         start_key = serialize_key(*min_key);
     }
     
-    std::vector<uint8_t> end_key;
-    if (max_key) {
-        end_key = serialize_key(*max_key);
+    std::vector<uint8_t> min_bytes;  // Cache for boundary check
+    if (min_key && !include_min) {
+        min_bytes = serialize_key(*min_key);
     }
+    
+    std::vector<uint8_t> max_bytes;  // Cache for boundary check
+    if (max_key) {
+        max_bytes = serialize_key(*max_key);
+    }
+    
+    // Pre-reserve result space to reduce allocations
+    iter.results_.reserve(1000);
+    
+    // Buffer for reconstructing full keys
+    std::vector<uint8_t> full_key_buffer(4096);
     
     const_cast<BTree*>(btree_.get())->scanAsc(
         std::span<uint8_t>(start_key.data(), start_key.size()),
         [&](BTreeNode& node, unsigned slot) -> bool {
-            auto node_key = std::span<uint8_t>(node.getKey(slot), node.slot[slot].keyLen);
+            // Reconstruct full key: prefix + slot key
+            uint16_t prefix_len = node.prefixLen;
+            uint16_t slot_key_len = node.slot[slot].keyLen;
+            uint16_t full_key_len = prefix_len + slot_key_len;
+            
+            if (full_key_len > full_key_buffer.size()) {
+                full_key_buffer.resize(full_key_len);
+            }
+            
+            std::memcpy(full_key_buffer.data(), node.getPrefix(), prefix_len);
+            std::memcpy(full_key_buffer.data() + prefix_len, node.getKey(slot), slot_key_len);
             
             // Extract actual key (without doc_id suffix for non-unique)
-            size_t actual_key_len = unique_ ? node_key.size() : 
-                (node_key.size() > sizeof(uint64_t) ? node_key.size() - sizeof(uint64_t) : 0);
+            size_t actual_key_len = unique_ ? full_key_len : 
+                (full_key_len > sizeof(uint64_t) ? full_key_len - sizeof(uint64_t) : 0);
             
-            // Check min bound
-            if (min_key && !include_min) {
-                auto min_bytes = serialize_key(*min_key);
+            // Check min bound (use pre-serialized key)
+            if (!min_bytes.empty()) {
                 if (actual_key_len == min_bytes.size() &&
-                    std::memcmp(node_key.data(), min_bytes.data(), min_bytes.size()) == 0) {
+                    std::memcmp(full_key_buffer.data(), min_bytes.data(), min_bytes.size()) == 0) {
                     return true;  // Skip this key, continue
                 }
             }
             
-            // Check max bound
-            if (max_key) {
-                auto max_bytes = serialize_key(*max_key);
+            // Check max bound (use pre-serialized key)
+            if (!max_bytes.empty()) {
                 int cmp = 0;
                 size_t cmp_len = std::min(actual_key_len, max_bytes.size());
                 if (cmp_len > 0) {
-                    cmp = std::memcmp(node_key.data(), max_bytes.data(), cmp_len);
+                    cmp = std::memcmp(full_key_buffer.data(), max_bytes.data(), cmp_len);
                 }
                 if (cmp > 0 || (cmp == 0 && actual_key_len > max_bytes.size())) {
                     return false;  // Past max, stop
@@ -397,22 +743,24 @@ BTreeRangeIterator BTreeMetadataIndex::range_scan(
                 }
             }
             
-            // Extract doc_id
-            if (!unique_ && node_key.size() >= sizeof(uint64_t)) {
-                uint64_t doc_id = 0;
-                size_t doc_id_start = node_key.size() - sizeof(uint64_t);
-                for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-                    doc_id = (doc_id << 8) | node_key[doc_id_start + i];
-                }
+            // Extract doc_id from the full key (appended at the end for non-unique)
+            if (!unique_ && full_key_len >= sizeof(uint64_t)) {
+                // OPTIMIZED: Use direct memory read instead of loop
+                size_t doc_id_start = full_key_len - sizeof(uint64_t);
+                uint64_t doc_id;
+                std::memcpy(&doc_id, &full_key_buffer[doc_id_start], sizeof(uint64_t));
+                // Convert from big-endian to native
+                doc_id = __builtin_bswap64(doc_id);
                 iter.results_.push_back(doc_id);
             } else if (unique_) {
                 // Get doc_id from payload
                 auto payload = node.getPayload(slot);
                 if (payload.size() >= sizeof(uint64_t)) {
-                    uint64_t doc_id = 0;
-                    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-                        doc_id = (doc_id << 8) | payload[i];
-                    }
+                    // OPTIMIZED: Use direct memory read instead of loop
+                    uint64_t doc_id;
+                    std::memcpy(&doc_id, payload.data(), sizeof(uint64_t));
+                    // Convert from big-endian to native
+                    doc_id = __builtin_bswap64(doc_id);
                     iter.results_.push_back(doc_id);
                 }
             }
@@ -761,6 +1109,9 @@ BTreeRangeIterator CompositeMetadataIndex::prefix_range_scan(
     std::shared_lock lock(mutex_);
     BTreeRangeIterator iter;
     
+    // PRE-SERIALIZE all keys ONCE (CRITICAL OPTIMIZATION)
+    auto base_prefix_bytes = serialize_composite_key(prefix);
+    
     // Build the start key by extending prefix with min_key
     CompositeKey start_prefix = prefix;
     if (min_key) {
@@ -775,13 +1126,15 @@ BTreeRangeIterator CompositeMetadataIndex::prefix_range_scan(
     }
     auto end_bytes = max_key ? serialize_composite_key(end_prefix) : make_prefix_upper_bound(prefix);
     
+    // Pre-reserve result space to reduce allocations
+    iter.results_.reserve(1000);
+    
     const_cast<BTree*>(btree_.get())->scanAsc(
         std::span<uint8_t>(start_bytes.data(), start_bytes.size()),
         [&](BTreeNode& node, unsigned slot) -> bool {
             auto node_key = std::span<uint8_t>(node.getKey(slot), node.slot[slot].keyLen);
             
-            // Check if we're still within the prefix
-            auto base_prefix_bytes = serialize_composite_key(prefix);
+            // Check if we're still within the prefix (use pre-serialized key)
             if (node_key.size() < base_prefix_bytes.size() ||
                 std::memcmp(node_key.data(), base_prefix_bytes.data(), base_prefix_bytes.size()) != 0) {
                 return false;  // Out of prefix range, stop
@@ -807,19 +1160,19 @@ BTreeRangeIterator CompositeMetadataIndex::prefix_range_scan(
             if (unique_) {
                 auto payload = node.getPayload(slot);
                 if (node.slot[slot].payloadLen >= sizeof(uint64_t)) {
-                    uint64_t doc_id = 0;
-                    for (int i = 0; i < 8; ++i) {
-                        doc_id = (doc_id << 8) | payload[i];
-                    }
+                    // OPTIMIZED: Direct memory read + byte swap
+                    uint64_t doc_id;
+                    std::memcpy(&doc_id, payload.data(), sizeof(uint64_t));
+                    doc_id = __builtin_bswap64(doc_id);
                     iter.results_.push_back(doc_id);
                 }
             } else {
                 if (node_key.size() >= base_prefix_bytes.size() + sizeof(uint64_t)) {
                     size_t doc_id_offset = node_key.size() - sizeof(uint64_t);
-                    uint64_t doc_id = 0;
-                    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-                        doc_id = (doc_id << 8) | node_key[doc_id_offset + i];
-                    }
+                    // OPTIMIZED: Direct memory read + byte swap
+                    uint64_t doc_id;
+                    std::memcpy(&doc_id, &node_key[doc_id_offset], sizeof(uint64_t));
+                    doc_id = __builtin_bswap64(doc_id);
                     iter.results_.push_back(doc_id);
                 }
             }

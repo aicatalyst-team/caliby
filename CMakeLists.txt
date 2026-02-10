@@ -73,6 +73,7 @@ set(CALIBY_SOURCES
     src/collection.cpp
     src/text_index.cpp
     src/btree_index.cpp
+    src/array_index.cpp
 )
 
 # Create static library

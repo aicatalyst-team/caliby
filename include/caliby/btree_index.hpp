@@ -149,6 +149,130 @@ private:
 };
 
 //=============================================================================
+// Histogram for Cardinality Estimation
+//=============================================================================
+
+/**
+ * Histogram for estimating cardinality of filter predicates.
+ * For numeric fields: equi-width histogram with configurable buckets.
+ * For string fields: frequency map of distinct values (top-N + other).
+ * 
+ * Used by query optimizer to estimate selectivity and choose between:
+ * - Progressive post-filtering (high selectivity)
+ * - Filtered HNSW traversal (medium selectivity)
+ * - Brute-force distance computation (low selectivity, for perfect recall)
+ */
+class FieldHistogram {
+public:
+    static constexpr size_t DEFAULT_NUM_BUCKETS = 64;
+    static constexpr size_t MAX_STRING_DISTINCT = 1000;  // Track top-N distinct values
+    
+    explicit FieldHistogram(BTreeKeyType key_type, size_t num_buckets = DEFAULT_NUM_BUCKETS);
+    
+    //-------------------------------------------------------------------------
+    // Update Operations
+    //-------------------------------------------------------------------------
+    
+    /**
+     * Add a value to the histogram.
+     */
+    void add_value(const BTreeKey& key);
+    
+    /**
+     * Remove a value from the histogram.
+     */
+    void remove_value(const BTreeKey& key);
+    
+    /**
+     * Rebuild histogram from a range of values (bulk load).
+     */
+    void rebuild(const std::vector<BTreeKey>& values);
+    
+    //-------------------------------------------------------------------------
+    // Cardinality Estimation
+    //-------------------------------------------------------------------------
+    
+    /**
+     * Estimate cardinality for equality predicate: field = value
+     * @return Estimated number of matching rows
+     */
+    uint64_t estimate_eq(const BTreeKey& value) const;
+    
+    /**
+     * Estimate cardinality for range predicate.
+     * @param min_val Lower bound (nullopt for unbounded)
+     * @param max_val Upper bound (nullopt for unbounded)
+     * @param include_min Include lower bound
+     * @param include_max Include upper bound
+     * @return Estimated number of matching rows
+     */
+    uint64_t estimate_range(
+        const std::optional<BTreeKey>& min_val,
+        const std::optional<BTreeKey>& max_val,
+        bool include_min = true,
+        bool include_max = true) const;
+    
+    /**
+     * Estimate cardinality for IN predicate: field IN (v1, v2, ...)
+     * @return Estimated number of matching rows
+     */
+    uint64_t estimate_in(const std::vector<BTreeKey>& values) const;
+    
+    //-------------------------------------------------------------------------
+    // Statistics
+    //-------------------------------------------------------------------------
+    
+    /**
+     * Get total count of values in histogram.
+     */
+    uint64_t total_count() const { return total_count_; }
+    
+    /**
+     * Get number of distinct values (approximate for numeric).
+     */
+    uint64_t distinct_count() const { return distinct_count_; }
+    
+    /**
+     * Get minimum value (for numeric types).
+     */
+    std::optional<double> min_value() const;
+    
+    /**
+     * Get maximum value (for numeric types).
+     */
+    std::optional<double> max_value() const;
+    
+private:
+    BTreeKeyType key_type_;
+    uint64_t total_count_ = 0;
+    uint64_t distinct_count_ = 0;
+    
+    // For numeric types (INT, FLOAT): equi-width histogram
+    size_t num_buckets_;
+    std::vector<uint64_t> bucket_counts_;  // Count per bucket
+    double min_val_ = std::numeric_limits<double>::max();
+    double max_val_ = std::numeric_limits<double>::lowest();
+    bool bounds_initialized_ = false;
+    
+    // For string types: frequency map
+    std::map<std::string, uint64_t> string_freq_;  // Exact counts for tracked strings
+    uint64_t other_count_ = 0;  // Count of strings not in freq map
+    
+    // For bool types: simple counts
+    uint64_t true_count_ = 0;
+    uint64_t false_count_ = 0;
+    
+    // Helper: convert key to double for numeric histogram
+    double key_to_double(const BTreeKey& key) const;
+    
+    // Helper: get bucket index for a value
+    size_t get_bucket_index(double val) const;
+    
+    // Helper: estimate fraction of bucket covered by range
+    double bucket_fraction(size_t bucket_idx, double range_min, double range_max) const;
+};
+
+//=============================================================================
 // B-tree Metadata Index Class
 //=============================================================================
 
@@ -262,6 +386,16 @@ public:
      */
     bool is_unique() const { return unique_; }
     
+    /**
+     * Get histogram for cardinality estimation.
+     */
+    const FieldHistogram& histogram() const { return histogram_; }
+    
+    /**
+     * Get mutable histogram (for rebuild operations).
+     */
+    FieldHistogram& histogram() { return histogram_; }
+    
 private:
     std::string field_name_;
     BTreeKeyType key_type_;
@@ -269,6 +403,9 @@ private:
     
     // Underlying B-tree from calico.hpp
     std::unique_ptr<BTree> btree_;
+    
+    // Histogram for cardinality estimation
+    FieldHistogram histogram_;
     
     // Thread safety
     mutable std::shared_mutex mutex_;
