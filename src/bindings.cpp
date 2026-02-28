@@ -206,11 +206,12 @@ PYBIND11_MODULE(caliby, m) {
                                      "Call set_buffer_config() before creating any indexes.");
         }
         set_buffer_config(virtgb, size_gb);
-    }, py::arg("size_gb"), py::arg("virtgb") = 24.0f,
+    }, py::arg("size_gb"), py::arg("virtgb") = 4.0f,
     "Configure buffer pool sizes (in GB) before system initialization. "
-    "Must be called before creating any indexes. "
-    "size_gb: physical buffer size (resident pages), "
-    "virtgb: virtual buffer size (total pages, defaults to 24GB - auto-computed per-index).");
+    "Must be called before open() or creating any indexes. "
+    "size_gb: physical buffer size in GB (default: 1.0), "
+    "virtgb: virtual buffer size in GB (default: 4.0). "
+    "If not called, reasonable defaults (1GB physical, 4GB virtual) are used.");
     
     // --- Logging Configuration ---
     py::enum_<caliby::LogLevel>(m, "LogLevel")

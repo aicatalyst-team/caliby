@@ -96,40 +96,43 @@ The Collection API provides a high-level interface for storing documents with ve
 import caliby
 import numpy as np
 
-# Initialize and create a collection
+# Initialize
 caliby.set_buffer_config(size_gb=1.0)
-caliby.open('/tmp/my_database')
-collection = caliby.create_collection("products")
+caliby.open('/tmp/my_database', cleanup_if_exist=True)
 
 # Define schema
-collection.set_schema({
-    "embedding": {"type": "vector", "dim": 128},
-    "description": {"type": "text"},
-    "category": {"type": "metadata"}
-})
+schema = caliby.Schema()
+schema.add_field("category", caliby.FieldType.STRING)
+schema.add_field("price", caliby.FieldType.FLOAT)
 
-# Add documents
-collection.add_documents([
-    {"id": "1", "embedding": np.random.rand(128).astype('float32'),
-     "description": "Wireless headphones", "category": "electronics"},
-    {"id": "2", "embedding": np.random.rand(128).astype('float32'),
-     "description": "Running shoes", "category": "sports"}
-])
+# Create a collection with 128-dimensional vectors
+collection = caliby.Collection("products", schema, vector_dim=128)
+
+# Add documents (returns assigned IDs)
+contents = ["Wireless headphones with noise cancellation",
+            "Running shoes for trail running"]
+metadatas = [{"category": "electronics", "price": 99.99},
+             {"category": "sports", "price": 79.99}]
+vectors = np.random.rand(2, 128).astype(np.float32).tolist()
+
+doc_ids = collection.add(contents, metadatas, vectors)
 
 # Create indices
-collection.create_hnsw_index("embedding", m=16, ef_construction=200)
-collection.create_text_index("description")
-collection.create_metadata_index("category")
+collection.create_hnsw_index("vec_idx", M=16, ef_construction=200)
+collection.create_text_index("text_idx")
+collection.create_metadata_index("category_idx", ["category"])
 
-# Vector search
-query = np.random.rand(128).astype('float32')
-results = collection.search_vector("embedding", query, k=10, 
-                                   filter={"category": "electronics"})
+# Vector search with metadata filter
+query = np.random.rand(128).astype(np.float32)
+results = collection.search_vector(query, "vec_idx", k=10,
+                                   filter='{"category": {"$eq": "electronics"}}')
 
 # Hybrid search (vector + text)
-results = collection.search_hybrid("embedding", query, 
-                                   text_field="description",
-                                   text_query="wireless", k=10, alpha=0.5)
+results = collection.search_hybrid(query, "vec_idx",
+                                   "wireless headphones", "text_idx", k=10)
+
+for r in results:
+    print(f"Doc {r.doc_id}: score={r.score:.4f}")
 
 caliby.close()
 ```

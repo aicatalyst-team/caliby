@@ -3,6 +3,7 @@
 #include "logging.hpp"
 
 #include <errno.h>
+#include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/ioctl.h>
@@ -900,7 +901,17 @@ BufferManager::BufferManager(unsigned nthreads)
 
     if (useTraditional) {
         frameMem = static_cast<Page*>(allocHuge(physCount * sizeof(Page)));
-        if (frameMem == MAP_FAILED) die("allocHuge frameMem");
+        if (frameMem == MAP_FAILED) {
+            std::string msg = "Failed to allocate buffer pool memory (";
+            msg += std::to_string(physCount * sizeof(Page) / (1024*1024));
+            msg += " MB). Try calling caliby.set_buffer_config(size_gb=X) with a smaller value before caliby.open(), ";
+            msg += "or increase system virtual memory limits. (mmap errno: ";
+            msg += std::to_string(errno);
+            msg += " - ";
+            msg += strerror(errno);
+            msg += ")";
+            throw std::runtime_error(msg);
+        }
         if (disableHugePageForFrameMem) {
             madvise(frameMem, physCount * sizeof(Page), MADV_NOHUGEPAGE);
         }
@@ -995,7 +1006,17 @@ BufferManager::BufferManager(unsigned nthreads)
                 madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
             }
         }
-        if (virtMem == MAP_FAILED) die("mmap failed");
+        if (virtMem == MAP_FAILED) {
+            std::string msg = "Failed to allocate virtual buffer memory (";
+            msg += std::to_string(virtAllocSize / (1024*1024));
+            msg += " MB). Try calling caliby.set_buffer_config(size_gb=X, virtgb=Y) with smaller values before caliby.open(). ";
+            msg += "(mmap errno: ";
+            msg += std::to_string(errno);
+            msg += " - ";
+            msg += strerror(errno);
+            msg += ")";
+            throw std::runtime_error(msg);
+        }
     }
 
     // Allocate PageState array (single-level or two-level)
@@ -1014,7 +1035,11 @@ BufferManager::BufferManager(unsigned nthreads)
     } else {
         if (disableHugePageForTranslationArray) {
             pageState = (PageState*)mmap(NULL, virtCount * sizeof(PageState), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (pageState == MAP_FAILED) die("mmap pageState");
+            if (pageState == MAP_FAILED) {
+                throw std::runtime_error("Failed to allocate page state array. "
+                    "Try reducing buffer config with caliby.set_buffer_config(). "
+                    "(mmap pageState errno: " + std::to_string(errno) + " - " + std::string(strerror(errno)) + ")");
+            }
             madvise(pageState, virtCount * sizeof(PageState), MADV_NOHUGEPAGE);
         } else {
             pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
@@ -1044,7 +1069,9 @@ BufferManager::BufferManager(unsigned nthreads)
         translationRefCounts = (std::atomic<u32>*)mmap(NULL, refCountSize, PROT_READ | PROT_WRITE,
                                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (translationRefCounts == MAP_FAILED) {
-            die("mmap translationRefCounts failed");
+            throw std::runtime_error("Failed to allocate translation reference counts. "
+                "Try reducing buffer config with caliby.set_buffer_config(). "
+                "(mmap errno: " + std::to_string(errno) + " - " + std::string(strerror(errno)) + ")");
         }
         // No need to initialize - mmap with MAP_ANONYMOUS gives zero-filled pages
     }
@@ -2975,8 +3002,10 @@ u64 BufferManager::countZeroRefCountGroups() {
 
 
 // Buffer configuration (used if env vars not set)
+// Defaults are kept small so caliby.open() works out-of-the-box on most systems.
+// Users can call set_buffer_config() before open() for larger workloads.
 static float config_virtgb = 24.0f;
-static float config_physgb = 16.0f;
+static float config_physgb = 4.0f;
 
 void set_buffer_config(float virtgb, float physgb) {
     config_virtgb = virtgb;

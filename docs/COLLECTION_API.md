@@ -20,7 +20,8 @@ Caliby provides a high-level Collection API for managing documents with vectors,
 import caliby
 import numpy as np
 
-# Initialize Caliby
+# Initialize Caliby (set_buffer_config is optional but recommended for large datasets)
+caliby.set_buffer_config(size_gb=1.0)
 caliby.open("/path/to/data")
 
 # Create a schema
@@ -35,7 +36,7 @@ collection = caliby.Collection("my_collection", schema, vector_dim=128)
 collection.create_hnsw_index("vec_idx", M=16, ef_construction=200)
 
 # Create metadata index for filtered search
-collection.create_metadata_index("category_idx", field="category")
+collection.create_metadata_index("category_idx", ["category"])
 
 # Add documents
 vectors = np.random.rand(1000, 128).astype(np.float32)
@@ -50,7 +51,7 @@ results = collection.search_vector(query_vector, "vec_idx", k=10)
 # Filtered vector search
 results = collection.search_vector(
     query_vector, "vec_idx", k=10,
-    filter={"category": 5}  # Only return documents where category == 5
+    filter='{"category": {"$eq": 5}}'  # Only return documents where category == 5
 )
 
 # Cleanup
@@ -65,6 +66,7 @@ caliby.close()
 import caliby
 
 # Initialize the system first
+caliby.set_buffer_config(size_gb=1.0)  # Optional: configure buffer pool size
 caliby.open("/path/to/data/directory")
 
 # Create schema for collection metadata
