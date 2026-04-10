@@ -2153,7 +2153,7 @@ void BufferManager::evict() {
     for (auto& pid : toWrite) {
         PageState& ps = getPageState(pid);
         u64 v = ps.stateAndVersion;
-        if ((PageState::getState(v) == 1) &&
+        if ((PageState::getState(v) == PageState::SharedBase) && // single shared reader
             ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
             toEvict.push_back(pid); // there were no new readers joined during the write-back, let's evict the page
         else
