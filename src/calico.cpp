@@ -460,13 +460,13 @@ void TwoLevelPageStateArray::registerIndex(u32 indexId, u64 maxPages, u64 initia
     if (indexId >= numIndexSlots) {
         throw std::out_of_range("TwoLevelPageStateArray::registerIndex: indexId out of range");
     }
-    
+
     std::unique_lock<std::shared_mutex> lock(indexMutex);
-    
-    // Check if already registered
+
+    // If already registered, just return — the index was already recovered or created
     IndexTranslationArray* existing = indexArrays[indexId].load(std::memory_order_acquire);
     if (existing != nullptr) {
-        throw std::runtime_error("TwoLevelPageStateArray::registerIndex: index already registered");
+        return;
     }
     
     // Create new per-index translation array

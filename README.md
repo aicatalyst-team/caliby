@@ -1,4 +1,8 @@
 <p align="center">
+  <strong>English</strong> | <a href="README_zh.md">中文</a>
+</p>
+
+<p align="center">
  <img src="docs/static/caliby_logo.png" alt="Caliby Logo" width="50%">
 </p>
 

@@ -107,16 +107,19 @@ def caliby_module_session(temp_dir_session):
         pass
 
 
-# Module-scoped fixtures that reference session fixtures
+# Module-scoped fixtures — each module gets its own subdirectory
+# to avoid cross-module catalog/index state pollution.
 @pytest.fixture(scope="module")
 def temp_dir(temp_dir_session):
-    """Module-scoped alias for temp_dir_session."""
-    return temp_dir_session
+    """Module-scoped: unique subdirectory per test module."""
+    import uuid
+    mod_dir = os.path.join(temp_dir_session, f"mod_{uuid.uuid4().hex[:8]}")
+    os.makedirs(mod_dir, exist_ok=True)
+    return mod_dir
 
 
-@pytest.fixture(scope="module") 
+@pytest.fixture(scope="module")
 def caliby_module(caliby_module_session):
-
     """Module-scoped alias for caliby_module_session."""
     return caliby_module_session
 
