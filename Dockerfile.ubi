@@ -6,18 +6,101 @@ FROM registry.access.redhat.com/ubi9/python-312 AS builder
 USER 0
 
 # Install build dependencies.
-# libaio-devel provides libaio.so symlink + headers needed by CMake find_library().
+# libaio-devel is NOT in UBI9 repos, so we install libaio (runtime) from UBI
+# and then download libaio-devel RPM from CentOS Stream 9 (binary-compatible).
 # libgomp provides OpenMP runtime used by the C++ code.
 RUN dnf install -y \
         gcc-c++ \
         cmake \
         make \
-        libaio-devel \
+        libaio \
         python3.12-devel \
         git \
     && dnf clean all
 
-# Install abseil-cpp from source (not available in UBI9 base repos)
+# Install libaio-devel headers from CentOS Stream 9 (compatible with UBI9).
+# The libaio-devel package is not available in UBI9 repos but the CentOS Stream 9
+# version is binary-compatible. We install it via RPM directly.
+RUN rpm -i --nodeps https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/Packages/libaio-devel-0.3.111-13.el9.x86_64.rpm || \
+    (echo "Fallback: creating libaio.h manually" && \
+     cat > /usr/include/libaio.h << 'HEADER_EOF'
+#ifndef __LIBAIO_H
+#define __LIBAIO_H
+#include <sys/types.h>
+#include <string.h>
+#include <linux/aio_abi.h>
+
+typedef struct io_context *io_context_t;
+
+enum io_iocb_cmd {
+    IO_CMD_PREAD = 0,
+    IO_CMD_PWRITE = 1,
+    IO_CMD_FSYNC = 2,
+    IO_CMD_FDSYNC = 3,
+    IO_CMD_NOOP = 6,
+    IO_CMD_PREADV = 7,
+    IO_CMD_PWRITEV = 8,
+};
+
+struct io_iocb_common {
+    void *buf;
+    unsigned long nbytes;
+    long long offset;
+    unsigned flags;
+    unsigned resfd;
+};
+
+struct iocb {
+    void *data;
+    unsigned key;
+    short aio_lio_opcode;
+    short aio_reqprio;
+    int aio_fildes;
+    union {
+        struct io_iocb_common c;
+    } u;
+};
+
+struct io_event {
+    void *data;
+    struct iocb *obj;
+    long long res;
+    long long res2;
+};
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int io_setup(int maxevents, io_context_t *ctxp);
+extern int io_destroy(io_context_t ctx);
+extern int io_submit(io_context_t ctx, long nr, struct iocb *ios[]);
+extern int io_cancel(io_context_t ctx, struct iocb *iocb, struct io_event *evt);
+extern int io_getevents(io_context_t ctx, long min_nr, long nr,
+                        struct io_event *events, struct timespec *timeout);
+static inline void io_prep_pread(struct iocb *iocb, int fd, void *buf, size_t count, long long offset) {
+    memset(iocb, 0, sizeof(*iocb));
+    iocb->aio_fildes = fd;
+    iocb->aio_lio_opcode = IO_CMD_PREAD;
+    iocb->u.c.buf = buf;
+    iocb->u.c.nbytes = count;
+    iocb->u.c.offset = offset;
+}
+static inline void io_prep_pwrite(struct iocb *iocb, int fd, void *buf, size_t count, long long offset) {
+    memset(iocb, 0, sizeof(*iocb));
+    iocb->aio_fildes = fd;
+    iocb->aio_lio_opcode = IO_CMD_PWRITE;
+    iocb->u.c.buf = buf;
+    iocb->u.c.nbytes = count;
+    iocb->u.c.offset = offset;
+}
+#ifdef __cplusplus
+}
+#endif
+#endif /* __LIBAIO_H */
+HEADER_EOF
+    )
+
+# Install abseil-cpp from source (not available in UBI9 repos)
 RUN cd /tmp && \
     git clone --depth 1 --branch 20230125.3 https://github.com/abseil/abseil-cpp.git && \
     cd abseil-cpp && \
@@ -52,8 +135,6 @@ RUN pip install --no-cache-dir setuptools wheel "cmake>=3.16" "pybind11>=2.6" nu
 # Build the wheel.
 # Use -march=x86-64-v3 for broad x86_64 AVX2/SSE4 support instead of
 # -march=native which would be specific to the build machine CPU.
-# Override all CMAKE_CXX_FLAGS_* variants via CXXFLAGS so the setup.py
-# -march=native defaults get replaced.
 RUN CXXFLAGS="-march=x86-64-v3" \
     pip wheel --no-cache-dir --wheel-dir=/tmp/wheels .
 
