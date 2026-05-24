@@ -5,14 +5,28 @@ FROM registry.access.redhat.com/ubi9/python-312 AS builder
 
 USER 0
 
-# Install C++ build toolchain, libaio, OpenMP, and git (for submodule init)
+# Install C++ build toolchain, OpenMP, and git (for submodule init).
+# libaio runtime package is available; for the -devel headers we fetch
+# libaio-devel from CentOS 9 Stream (UBI9 repos lack -devel packages
+# without a RHEL subscription).
 RUN dnf install -y \
         gcc-c++ \
         cmake \
         make \
-        libaio-devel \
+        libaio \
         libgomp \
         git \
+    && dnf clean all
+
+# Install libaio-devel from CentOS 9 Stream repo (header + unversioned .so symlink)
+RUN dnf install -y \
+        --repofrompath=centos9-baseos,https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/ \
+        --repofrompath=centos9-appstream,https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/ \
+        --repofrompath=centos9-crb,https://mirror.stream.centos.org/9-stream/CRB/x86_64/os/ \
+        --setopt=centos9-baseos.gpgcheck=0 \
+        --setopt=centos9-appstream.gpgcheck=0 \
+        --setopt=centos9-crb.gpgcheck=0 \
+        libaio-devel \
     && dnf clean all
 
 # Build and install abseil-cpp from source (not in UBI9 repos)
@@ -45,8 +59,6 @@ RUN if [ ! -f third_party/pybind11/CMakeLists.txt ]; then \
     fi
 
 # Build the wheel — CMake is invoked via setup.py / pyproject.toml
-# Use -march=x86-64-v3 for broad AVX2 compat instead of -march=native
-# which may pick up build-host-only features.
 ENV CMAKE_PREFIX_PATH=/usr/local
 RUN pip install --no-cache-dir wheel setuptools "cmake>=3.16" "pybind11>=2.6" \
     && pip wheel --no-cache-dir --wheel-dir /tmp/wheels . \
