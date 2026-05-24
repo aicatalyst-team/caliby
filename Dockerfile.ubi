@@ -13,6 +13,7 @@ RUN dnf install -y \
         libaio \
         libgomp \
         git \
+        diffutils \
     && dnf clean all
 
 # Install libaio-devel from CentOS 9 Stream repo (header + unversioned .so symlink)
@@ -26,7 +27,8 @@ RUN dnf install -y \
         libaio-devel \
     && dnf clean all
 
-# Build and install abseil-cpp from source (not in UBI9 repos)
+# Build and install abseil-cpp from source (not in UBI9 repos).
+# Use LTS version 20230802.1 which is well-tested with C++20 / GCC 11.
 RUN cd /tmp \
     && git clone --depth 1 --branch 20230802.1 https://github.com/abseil/abseil-cpp.git \
     && cd abseil-cpp \
@@ -52,23 +54,38 @@ RUN if [ ! -f README.md ]; then echo "# Caliby" > README.md; fi
 
 # Initialise pybind11 submodule (if not already present)
 RUN if [ ! -f third_party/pybind11/CMakeLists.txt ]; then \
-        git init . 2>/dev/null || true; \
-        git submodule update --init --recursive 2>/dev/null || \
-        ( mkdir -p third_party/pybind11 && \
-          git clone --depth 1 https://github.com/pybind/pybind11.git third_party/pybind11 ); \
+        mkdir -p third_party/pybind11 && \
+        git clone --depth 1 https://github.com/pybind/pybind11.git third_party/pybind11; \
     fi
 
-# Suppress GCC warnings that are treated as errors during the C++ compilation:
-#   -Wno-error            : prevent any -Werror from killing the build
-#   -Wno-unused-parameter : hash_tables.hpp deallocate(T* ptr, size_t n)
-#   -Wno-maybe-uninitialized : calico.cpp:2968 pos variable
-ENV CMAKE_PREFIX_PATH=/usr/local
-ENV CXXFLAGS="-Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized"
+# ---- Critical fix: Patch CMakeLists.txt and setup.py to suppress warnings ----
+#
+# 1. Add -Wno-reorder -Wno-unused-variable -Wno-unused-parameter
+#    -Wno-maybe-uninitialized -Wno-sign-compare to CMAKE_CXX_FLAGS so they
+#    apply regardless of build type.
+# 2. Patch setup.py's CMAKE_CXX_FLAGS_RELEASE to include the same.
+# 3. Also add -Wno-error as a safety net.
+#
+RUN sed -i \
+      's|set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC")|set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -fPIC -Wno-error -Wno-reorder -Wno-unused-variable -Wno-unused-parameter -Wno-maybe-uninitialized -Wno-sign-compare -Wno-missing-field-initializers -Wno-unused-but-set-variable")|' \
+      CMakeLists.txt \
+    && sed -i \
+      's|-DCMAKE_CXX_FLAGS_RELEASE=-O3 -g -fno-omit-frame-pointer -march=native -DNDEBUG -DCALICO_SPECIALIZATION_CALICO"|-DCMAKE_CXX_FLAGS_RELEASE=-O3 -g -fno-omit-frame-pointer -march=native -DNDEBUG -DCALICO_SPECIALIZATION_CALICO -Wno-error -Wno-reorder -Wno-unused-variable -Wno-unused-parameter -Wno-maybe-uninitialized -Wno-sign-compare -Wno-missing-field-initializers -Wno-unused-but-set-variable"|' \
+      setup.py
 
-# Build the wheel — CMake is invoked via setup.py / pyproject.toml
-RUN pip install --no-cache-dir wheel setuptools "cmake>=3.16" "pybind11>=2.6" \
+# Set CMAKE_PREFIX_PATH so find_package(absl) locates the installed config files.
+# Also set CXXFLAGS as an additional belt-and-suspenders measure.
+ENV CMAKE_PREFIX_PATH=/usr/local
+ENV CXXFLAGS="-Wno-error -Wno-reorder -Wno-unused-variable -Wno-unused-parameter -Wno-maybe-uninitialized -Wno-sign-compare -Wno-missing-field-initializers -Wno-unused-but-set-variable"
+
+# Build the wheel — CMake is invoked via setup.py / pyproject.toml.
+# Install build dependencies first, then build the wheel, then install it.
+RUN pip install --no-cache-dir wheel setuptools "cmake>=3.16" "pybind11>=2.6" numpy \
     && pip wheel --no-cache-dir --wheel-dir /tmp/wheels . \
     && pip install --no-cache-dir /tmp/wheels/caliby-*.whl
+
+# Quick smoke test to verify the extension loads
+RUN python -c "import caliby; print('caliby version:', caliby.__version__)"
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — slim image with only the compiled extension + deps
