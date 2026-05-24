@@ -5,16 +5,25 @@ FROM registry.access.redhat.com/ubi9/python-312 AS builder
 
 USER 0
 
-# Install build dependencies
+# Install build dependencies available in UBI9 repos.
+# Note: libaio-devel is NOT in UBI9 repos; we install libaio (runtime) and
+#       fetch the header separately. liburing-devel is also unavailable but
+#       io_uring support is optional, so we skip it.
 RUN dnf install -y \
         gcc-c++ \
         cmake \
         make \
-        libaio-devel \
-        liburing-devel \
+        libaio \
         python3.12-devel \
         git \
     && dnf clean all
+
+# Install libaio-devel header (not available as RPM in UBI9).
+# libaio.h is a stable, well-known header — fetch from upstream source.
+RUN cd /tmp && \
+    git clone --depth 1 --branch libaio-0.3.113 https://pagure.io/libaio.git && \
+    cp libaio/src/libaio.h /usr/include/libaio.h && \
+    rm -rf /tmp/libaio
 
 # Install abseil-cpp from source (not available in UBI9 base repos)
 RUN cd /tmp && \
@@ -48,9 +57,9 @@ RUN if [ ! -f third_party/pybind11/CMakeLists.txt ]; then \
 # Install Python build dependencies
 RUN pip install --no-cache-dir setuptools wheel "cmake>=3.16" "pybind11>=2.6" numpy
 
-# Build the wheel
+# Build the wheel.
 # Use -march=x86-64-v3 for broad x86_64 AVX2/SSE4 support instead of
-# -march=native which would be specific to the build machine CPU
+# -march=native which would be specific to the build machine CPU.
 RUN CXXFLAGS="-march=x86-64-v3" \
     pip wheel --no-cache-dir --wheel-dir=/tmp/wheels .
 
@@ -61,10 +70,10 @@ FROM registry.access.redhat.com/ubi9/python-312
 
 USER 0
 
-# Install runtime libraries needed by the compiled C++ extension
+# Install runtime libraries needed by the compiled C++ extension.
+# libaio is available in UBI9 base repos; liburing is optional and skipped.
 RUN dnf install -y \
         libaio \
-        liburing \
     && dnf clean all
 
 WORKDIR /opt/app-root/src
