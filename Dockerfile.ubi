@@ -5,18 +5,23 @@ FROM registry.access.redhat.com/ubi9/python-312 AS builder
 
 USER 0
 
-# Install build dependencies: C++20 compiler, cmake, make, libaio + headers, OpenMP
-# Use CRB repo for libaio-devel (available in CodeReady Builder on UBI9)
+# Install build dependencies: C++20 compiler, cmake, make, libaio runtime, OpenMP
+# Note: libaio-devel is NOT available in UBI9 repos, so we install libaio (runtime)
+# and fetch the libaio.h header separately from source.
 RUN dnf install -y \
         gcc-c++ \
         cmake \
         make \
         libaio \
-        libaio-devel \
         libgomp \
         python3.12-devel \
         git \
     && dnf clean all
+
+# Install libaio.h header manually (libaio-devel is not in UBI9 repos).
+# The header is a single file from the libaio source.
+RUN curl -fsSL https://pagure.io/libaio/raw/master/f/src/libaio.h \
+        -o /usr/include/libaio.h
 
 # Install abseil-cpp from source (not available in UBI9 repos).
 # Limit parallelism to -j2 to avoid OOM on resource-constrained build pods.
