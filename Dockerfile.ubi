@@ -5,10 +5,7 @@ FROM registry.access.redhat.com/ubi9/python-312 AS builder
 
 USER 0
 
-# Install C++ build toolchain, OpenMP, and git (for submodule init).
-# libaio runtime package is available; for the -devel headers we fetch
-# libaio-devel from CentOS 9 Stream (UBI9 repos lack -devel packages
-# without a RHEL subscription).
+# Install C++ build toolchain, OpenMP, libaio, and git (for submodule init)
 RUN dnf install -y \
         gcc-c++ \
         cmake \
@@ -47,8 +44,11 @@ RUN cd /tmp \
 
 WORKDIR /opt/app-root/src
 
-# Copy full source tree
+# Copy full source tree (README.md is now included — see .dockerignore fix)
 COPY . .
+
+# Ensure README.md exists so setup.py line 71 does not fail
+RUN if [ ! -f README.md ]; then echo "# Caliby" > README.md; fi
 
 # Initialise pybind11 submodule (if not already present)
 RUN if [ ! -f third_party/pybind11/CMakeLists.txt ]; then \
@@ -79,13 +79,13 @@ RUN dnf install -y \
 
 WORKDIR /opt/app-root/src
 
-# Copy installed Python packages from builder
+# Copy installed Python packages (including the compiled caliby .so) from builder
 COPY --from=builder /opt/app-root/lib /opt/app-root/lib
 
 # Install runtime Python deps + test tooling (needed for PoC validation)
 RUN pip install --no-cache-dir numpy "pytest>=6.0" pytest-benchmark
 
-# Copy tests into the image for PoC validation
+# Copy tests and pytest config into the image for PoC validation
 COPY tests/ /opt/app-root/src/tests/
 COPY pytest.ini /opt/app-root/src/
 
