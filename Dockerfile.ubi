@@ -1,3 +1,86 @@
-RUN curl -fsSL https://pagure.io/libaio/raw/master/f/src/libaio.h \
-        -o /usr/include/libaio.h \
-    && ln -sf /usr/lib64/libaio.so.1 /usr/lib64/libaio.so
+# ---------------------------------------------------------------------------
+# Stage 1: Builder — compile C++ extension with all build dependencies
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/python-312 AS builder
+
+USER 0
+
+# Install C++ build toolchain, libaio, OpenMP, and git (for submodule init)
+RUN dnf install -y \
+        gcc-c++ \
+        cmake \
+        make \
+        libaio-devel \
+        libgomp \
+        git \
+    && dnf clean all
+
+# Build and install abseil-cpp from source (not in UBI9 repos)
+RUN cd /tmp \
+    && git clone --depth 1 --branch 20230802.1 https://github.com/abseil/abseil-cpp.git \
+    && cd abseil-cpp \
+    && mkdir build && cd build \
+    && cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DABSL_BUILD_TESTING=OFF \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DCMAKE_CXX_STANDARD=20 \
+    && cmake --build . -j"$(nproc)" \
+    && cmake --install . \
+    && rm -rf /tmp/abseil-cpp
+
+WORKDIR /opt/app-root/src
+
+# Copy full source tree
+COPY . .
+
+# Initialise pybind11 submodule (if not already present)
+RUN if [ ! -f third_party/pybind11/CMakeLists.txt ]; then \
+        git init . 2>/dev/null || true; \
+        git submodule update --init --recursive 2>/dev/null || \
+        ( mkdir -p third_party/pybind11 && \
+          git clone --depth 1 https://github.com/pybind/pybind11.git third_party/pybind11 ); \
+    fi
+
+# Build the wheel — CMake is invoked via setup.py / pyproject.toml
+# Use -march=x86-64-v3 for broad AVX2 compat instead of -march=native
+# which may pick up build-host-only features.
+ENV CMAKE_PREFIX_PATH=/usr/local
+RUN pip install --no-cache-dir wheel setuptools "cmake>=3.16" "pybind11>=2.6" \
+    && pip wheel --no-cache-dir --wheel-dir /tmp/wheels . \
+    && pip install --no-cache-dir /tmp/wheels/caliby-*.whl
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime — slim image with only the compiled extension + deps
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/python-312
+
+USER 0
+
+# Runtime libraries required by the compiled .so
+RUN dnf install -y \
+        libaio \
+        libgomp \
+    && dnf clean all
+
+WORKDIR /opt/app-root/src
+
+# Copy installed Python packages from builder
+COPY --from=builder /opt/app-root/lib /opt/app-root/lib
+
+# Install runtime Python deps + test tooling (needed for PoC validation)
+RUN pip install --no-cache-dir numpy "pytest>=6.0" pytest-benchmark
+
+# Copy tests into the image for PoC validation
+COPY tests/ /opt/app-root/src/tests/
+COPY pytest.ini /opt/app-root/src/
+
+# OpenShift compatibility — group 0 permissions for arbitrary UID
+RUN chgrp -R 0 /opt/app-root && chmod -R g=u /opt/app-root
+
+USER 1001
+
+ENTRYPOINT ["python", "-c", "import caliby; print('Caliby ready')"]
+CMD ["--help"]
