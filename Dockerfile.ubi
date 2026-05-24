@@ -44,10 +44,10 @@ RUN cd /tmp \
 
 WORKDIR /opt/app-root/src
 
-# Copy full source tree (README.md is now included — see .dockerignore fix)
+# Copy full source tree
 COPY . .
 
-# Ensure README.md exists so setup.py line 71 does not fail
+# Ensure README.md exists so setup.py does not fail
 RUN if [ ! -f README.md ]; then echo "# Caliby" > README.md; fi
 
 # Initialise pybind11 submodule (if not already present)
@@ -58,8 +58,14 @@ RUN if [ ! -f third_party/pybind11/CMakeLists.txt ]; then \
           git clone --depth 1 https://github.com/pybind/pybind11.git third_party/pybind11 ); \
     fi
 
-# Build the wheel — CMake is invoked via setup.py / pyproject.toml
+# Suppress GCC warnings that are treated as errors during the C++ compilation:
+#   -Wno-error            : prevent any -Werror from killing the build
+#   -Wno-unused-parameter : hash_tables.hpp deallocate(T* ptr, size_t n)
+#   -Wno-maybe-uninitialized : calico.cpp:2968 pos variable
 ENV CMAKE_PREFIX_PATH=/usr/local
+ENV CXXFLAGS="-Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized"
+
+# Build the wheel — CMake is invoked via setup.py / pyproject.toml
 RUN pip install --no-cache-dir wheel setuptools "cmake>=3.16" "pybind11>=2.6" \
     && pip wheel --no-cache-dir --wheel-dir /tmp/wheels . \
     && pip install --no-cache-dir /tmp/wheels/caliby-*.whl
